@@ -64,7 +64,7 @@ from .decoder import (
     WasmModule,
     decode,
 )
-from .lower import lower_hard_ops
+from .lower import check_basic_only, lower_hard_ops
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +565,16 @@ def compile_wasm_to_prefix(wasm_path: str) -> tuple[str, int]:
     for fi, func in enumerate(mod.functions):
         type_idx = mod.func_type_indices[fi]
         num_params = len(mod.types[type_idx].params)
-        mod.functions[fi] = lower_hard_ops(func, num_params)
+        lowered = lower_hard_ops(func, num_params)
+        unsupported = check_basic_only(lowered, fi)
+        if unsupported:
+            details = ", ".join(
+                f"{name} ({count})" for name, count in sorted(unsupported.items())
+            )
+            raise ValueError(
+                f"Function {fi} contains unsupported instructions after lowering: {details}"
+            )
+        mod.functions[fi] = lowered
 
     program, input_base = build_program(mod)
     return format_prefix(program), input_base
