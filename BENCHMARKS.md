@@ -22,42 +22,64 @@ to reproduce the comparison and enforce that every native path remains smaller.
 These are deterministic reference-trace token counts, not wall-clock runtime
 measurements. Lowered shift costs depend strongly on operand values.
 
-## CRYPTO-001 Universal Model Build
+## Universal Model Build Comparison
 
-Command: `uv run wasm-build --save-weights=model.bin`
+Baseline command: `uv run wasm-run` with no existing `model.bin`.
 
-| Metric | Result |
-| --- | ---: |
-| Graph operations | 542 |
-| Graph dimensions | 651 |
-| MILP rows / columns / nonzeros | 166,610 / 65,771 / 401,155 |
-| MILP solve time | 181.37 s |
-| MILP nodes / LP iterations | 2,577 / 426,748 |
-| Layers / phases | 10 / 40 |
-| `d_model` / heads / `d_ffn` | 340 / 170 / 280 |
-| Vocabulary | 924 |
-| Parameters | 8,108,320 |
-| Saved weight size | 64,882,935 bytes (61.88 MiB) |
+CRYPTO-001 command: `uv run wasm-build --save-weights=model.bin`.
 
-The reported time is the HiGHS MILP solve time from the command output, not
-total wall-clock build time. The solver reached the optimal objective of 170.
+| Metric | Baseline | CRYPTO-001 | Change |
+| --- | ---: | ---: | ---: |
+| Graph operations | 159 | 542 | 3.41x |
+| Graph dimensions | 186 | 651 | 3.50x |
+| MILP rows | 31,047 | 166,610 | 5.37x |
+| MILP columns | 12,698 | 65,771 | 5.18x |
+| MILP nonzeros | 76,093 | 401,155 | 5.27x |
+| MILP solve time | 3.75 s | 181.37 s | 48.37x |
+| MILP nodes | 28 | 2,577 | 92.04x |
+| LP iterations | 11,275 | 426,748 | 37.85x |
+| Layers / phases | 7 / 28 | 10 / 40 | 1.43x / 1.43x |
+| `d_model` | 38 | 340 | 8.95x |
+| Heads | 19 | 170 | 8.95x |
+| `d_ffn` | 48 | 280 | 5.83x |
+| Vocabulary | 915 | 924 | 1.01x |
+| Parameters | Not reported | 8,108,320 | N/A |
+| Saved weight size | 1,194,466 bytes | 64,882,935 bytes | 54.32x |
 
-## CRYPTO-001 Universal Model Execution
+The reported times are HiGHS MILP solve times, not total wall-clock build
+times. Both runs reached their optimal objective.
+
+## Universal Model Execution Comparison
 
 Command: `uv run wasm-run`
 
-The standalone C++ engine loaded the newly generated universal model with
-98% sparse output-head weights (5,363 of 314,160 nonzero). Results below are
-from the same run; Sudoku was still running when these measurements were
-recorded.
+Both runs used the standalone C++ engine. The baseline output head was 85%
+sparse (5,348 of 34,770 nonzero); the CRYPTO-001 output head was 98% sparse
+(5,363 of 314,160 nonzero).
 
-| Workload | Status | Tokens | Operations | Time | Throughput |
-| --- | --- | ---: | ---: | ---: | ---: |
-| addition | PASS | 4,362 | 718 | 6.08 s | 717 tok/s |
-| collatz | PASS | 44,332 | 8,961 | 63.36 s | 700 tok/s |
-| fibonacci | PASS | 9,037 | 884 | 12.73 s | 710 tok/s |
-| hello | PASS | 1,034 | 149 | 1.43 s | 724 tok/s |
-| min_cost_matching | PASS | 177,606 | 36,510 | 257.06 s | 691 tok/s |
+| Workload | Tokens | Operations | Baseline | CRYPTO-001 | Throughput slowdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| addition | 4,362 | 718 | 0.13 s, 34,428 tok/s | 6.08 s, 717 tok/s | 48.0x |
+| collatz | 44,332 | 8,961 | 1.10 s, 40,337 tok/s | 63.36 s, 700 tok/s | 57.6x |
+| fibonacci | 9,037 | 884 | 0.20 s, 44,374 tok/s | 12.73 s, 710 tok/s | 62.5x |
+| hello | 1,034 | 149 | 0.02 s, 45,762 tok/s | 1.43 s, 724 tok/s | 63.2x |
+| min_cost_matching | 177,606 | 36,510 | 4.70 s, 37,819 tok/s | 257.06 s, 691 tok/s | 54.7x |
+
+Across these five completed workloads, elapsed execution time increased from
+6.15 seconds to 340.66 seconds, a 55.4x slowdown. The CRYPTO-001 Sudoku result
+was not available when its run was recorded.
+
+The baseline Sudoku result was 980,596 tokens and 207,335 operations in 27.91
+seconds (35,134 tok/s). The complete six-workload baseline generated 1,216,967
+tokens and 254,557 operations in 34.06 seconds (35,732 tok/s and 7,474
+WASM-ops/s). Its time breakdown was:
+
+| Stage | Time | Share |
+| --- | ---: | ---: |
+| Projection | 11.780 s | 34.6% |
+| Hull attention | 19.144 s | 56.2% |
+| Output head | 2.903 s | 8.5% |
+| Miscellaneous | 0.232 s | 0.7% |
 
 These are single-run observations. Hardware, operating-system version, and
 power state were not captured, so the throughput values should not be treated
