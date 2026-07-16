@@ -85,6 +85,7 @@ points = [
 
 OPCODES = {
     "halt": 0x00,
+    "trap": 0x01,
     "return": 0x0F,
     "call": 0x10,
     "br": 0x0C,
@@ -162,6 +163,7 @@ STACK_DELTA = {
     "br": 0,
     "output": -1,
     "halt": 0,
+    "trap": 0,
     "call": 0,
     "return": 0,
     "input_base": 0,
@@ -557,6 +559,7 @@ def build(program=None):
     is_byte_seq = 1 - is_boundary - byte_done
 
     emit_halt = reglu(is_boundary, op_dot("halt"))
+    emit_trap = reglu(is_boundary, op_dot("trap"))
     emit_branch_taken = (
         reglu(is_boundary, op_dot("br") - is_branch_taken)
         + reglu(is_boundary, cond_nonzero + op_dot("br_if") - is_branch_taken - 1)
@@ -573,6 +576,7 @@ def build(program=None):
         byte_done
         + is_boundary
         - emit_halt
+        - emit_trap
         - emit_branch_taken
         - emit_return_commit
         - emit_out
@@ -585,6 +589,7 @@ def build(program=None):
     H = 1e5
     output_tokens = {}
     output_tokens["halt"] = H * emit_halt
+    output_tokens["trap"] = H * emit_trap
     output_tokens["branch_taken"] = H * emit_branch_taken
     output_tokens["call_commit"] = H * emit_call_commit
     output_tokens["return_commit"] = H * emit_return_commit

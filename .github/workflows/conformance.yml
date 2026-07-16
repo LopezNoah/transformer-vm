@@ -1,0 +1,21 @@
+name: Conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cor005:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run differential conformance suite
+        run: uv run pytest transformer_vm/tests/test_cor005_conformance.py -m conformance --tb=short

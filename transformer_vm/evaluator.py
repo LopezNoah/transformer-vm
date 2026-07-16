@@ -316,6 +316,7 @@ def run_program(program_file, ref_file=None, use_hull=False, verbose=False):
     draining = False
     max_steps = 50000
     halted = False
+    trapped = False
 
     for _step in range(max_steps):
         next_tok = rt.predict_next(vals)
@@ -331,12 +332,18 @@ def run_program(program_file, ref_file=None, use_hull=False, verbose=False):
         if next_tok == "halt":
             halted = True
             break
+        if next_tok == "trap":
+            trapped = True
+            break
 
         vals = rt.step(next_tok)
 
     if verbose:
         logger.info("  Tokens: %s", " ".join(predicted))
 
+    if trapped:
+        logger.error("Execution trapped")
+        return False
     if not halted:
         logger.error("Execution did not emit halt before the generation limit")
         return False

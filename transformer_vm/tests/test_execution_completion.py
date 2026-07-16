@@ -77,10 +77,11 @@ def test_graph_runner_requires_halt(monkeypatch, tmp_path):
 
 
 def test_reference_run_reports_limit_exhaustion():
-    _instructions, token_count, _output, halted = run([("i32.const", 0)], max_tokens=5)
+    _instructions, token_count, _output, halted, trapped = run([("i32.const", 0)], max_tokens=5)
 
     assert token_count == 5
     assert not halted
+    assert not trapped
 
 
 def test_reference_generator_does_not_write_incomplete_trace(tmp_path, monkeypatch):
@@ -89,7 +90,7 @@ def test_reference_generator_does_not_write_incomplete_trace(tmp_path, monkeypat
     program.write_text("{\ni32.const 00 00 00 00\n}\n")
     monkeypatch.setattr(
         "transformer_vm.wasm.reference.run",
-        lambda *_args, **_kwargs: (1, 5, "", False, ["00", "00", "00", "00"]),
+        lambda *_args, **_kwargs: (1, 5, "", False, False, ["00", "00", "00", "00"]),
     )
 
     with pytest.raises(RuntimeError, match="did not emit halt"):

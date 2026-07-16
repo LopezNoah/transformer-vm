@@ -101,7 +101,7 @@ WASM_TO_NAME = {
     OP_I32_STORE16: "i32.store16",
     OP_BR: "br",
     OP_BR_IF: "br_if",
-    OP_UNREACHABLE: "halt",
+    OP_UNREACHABLE: "trap",
     OP_RETURN: "halt",
 }
 
@@ -171,6 +171,7 @@ def compile_c_to_wasm(c_path: str) -> str:
         "-Wl,--no-entry",
         "-Wl,--export=compute",
         "-Wl,--export=__heap_base",
+        "-Wl,--export-memory",
         "-Wl,-z,stack-size=4096",
         "-Wl,--initial-memory=10485760",
         f"-include{runtime_h}",
@@ -306,7 +307,7 @@ def compile_function(
             entries.append(("halt" if is_main else "return", 0))
             continue
         if op == OP_UNREACHABLE:
-            entries.append(("halt", 0))
+            entries.append(("trap", 0))
             continue
 
         if op == OP_CALL:

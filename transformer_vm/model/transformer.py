@@ -68,7 +68,8 @@ class VanillaTransformer(nn.Module):
             if pos + 1 == len(idx_list):
                 next_id = self.head(x).argmax().item()
                 idx_list.append(next_id)
-                if next_id == self.stop_token_id:
+                terminal_token_ids = getattr(self, "terminal_token_ids", {self.stop_token_id})
+                if next_id in terminal_token_ids:
                     break
 
         return torch.tensor([idx_list], dtype=torch.long, device=idx.device)

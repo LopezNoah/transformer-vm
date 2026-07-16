@@ -373,6 +373,9 @@ def build_model(
         d_ffn=d_ffn,
         stop_token_id=tok_to_idx_map.get("halt", 0),
     )
+    model.terminal_token_ids = {
+        token for token in (tok_to_idx_map.get("halt"), tok_to_idx_map.get("trap")) if token is not None
+    }
 
     # ── Populate weights ──────────────────────────────────────────
     sqrt_dh = math.sqrt(2.0)
@@ -728,6 +731,9 @@ def load_weights(path):
             d_ffn=d_ffn,
             stop_token_id=stop_token_id,
         )
+        model.terminal_token_ids = {
+            token for token in (tok_to_idx_map.get("halt"), tok_to_idx_map.get("trap")) if token is not None
+        }
 
         def R(shape):
             n = 1

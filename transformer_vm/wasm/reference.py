@@ -136,8 +136,8 @@ def _extract_input(tokens):
 def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=False):
     """Execute a compiled WASM program.
 
-    Returns (instr_count, token_count, output_str, halted) or, if trace=True,
-    (instr_count, token_count, output_str, halted, trace_tokens).
+    Returns (instr_count, token_count, output_str, halted, trapped) or, if trace=True,
+    (instr_count, token_count, output_str, halted, trapped, trace_tokens).
     """
     mem = bytearray(10 * 1024 * 1024)
 
@@ -157,6 +157,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
     output = []
     trace_tokens = [] if trace else None
     halted = False
+    trapped = False
 
     while pc < len(program) and token_count < max_tokens:
         op, imm = program[pc]
@@ -179,6 +180,13 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
             if trace:
                 trace_tokens.append("halt")
             halted = True
+            break
+
+        elif op == "trap":
+            token_count += 1
+            if trace:
+                trace_tokens.append("trap")
+            trapped = True
             break
 
         elif op == "i32.const":
@@ -546,7 +554,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
         else:
             raise RuntimeError(f"Unknown op: {op} at pc={pc}")
 
-    result = (instr_count, token_count, "".join(output), halted)
+    result = (instr_count, token_count, "".join(output), halted, trapped)
     if trace:
         return result + (trace_tokens,)
     return result
@@ -579,6 +587,7 @@ def format_trace(program_path, trace_tokens):
             tok.startswith("commit(")
             or tok.startswith("out(")
             or tok == "halt"
+            or tok == "trap"
             or tok == "branch_taken"
             or tok == "call_commit"
             or tok == "return_commit"
@@ -609,9 +618,11 @@ def generate_ref(prog_path, ref_path=None, max_tokens=100_000_000):
     if ref_path is None:
         ref_path = prog_path.replace(".txt", "_ref.txt")
     program, input_str = load_program(prog_path)
-    _instrs, token_count, output, halted, trace_tokens = run(
+    _instrs, token_count, output, halted, trapped, trace_tokens = run(
         program, input_str, max_tokens=max_tokens, trace=True
     )
+    if trapped:
+        raise RuntimeError("Reference execution trapped")
     if not halted:
         raise RuntimeError(
             f"Reference execution did not emit halt before ending or reaching the {max_tokens}-token limit"

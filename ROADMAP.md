@@ -57,12 +57,12 @@ Relevant code: `transformer_vm/runner.py`, `transformer_vm/evaluator.py`,
 
 ### COR-005: Build a differential conformance suite
 
-- [ ] Compare the reference interpreter with an independent WASM engine.
-- [ ] Compare graph evaluation with PyTorch standard attention.
-- [ ] Compare PyTorch standard attention with hull attention.
-- [ ] Compare Python inference with the standalone C++ runtime.
-- [ ] Cover arithmetic boundaries, control flow, memory, locals, calls, and traps.
-- [ ] Run a focused conformance subset in CI.
+- [x] Compare the reference interpreter with an independent WASM engine.
+- [x] Compare graph evaluation with PyTorch standard attention.
+- [x] Compare PyTorch standard attention with hull attention.
+- [x] Compare Python inference with the standalone C++ runtime.
+- [x] Cover arithmetic boundaries, control flow, memory, locals, calls, and traps.
+- [x] Run a focused conformance subset in CI.
 
 ## P0: Input and Artifact Security
 

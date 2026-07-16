@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
 
     bool regen = false, brute = false;
     int trace_every = 0;
+    const char* trace_file = nullptr;
     const char* args_str = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--regen") == 0) regen = true;
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
             trace_every = 1;
             if (argv[i][7] == '=') trace_every = atoi(argv[i] + 8);
         }
+        if (strncmp(argv[i], "--trace-file=", 13) == 0) trace_file = argv[i] + 13;
         if (strncmp(argv[i], "--args=", 7) == 0) args_str = argv[i] + 7;
         else if (strcmp(argv[i], "--args") == 0 && i + 1 < argc) args_str = argv[++i];
     }
@@ -281,6 +283,7 @@ int main(int argc, char** argv) {
         printf("%s: ", test.c_str()); fflush(stdout);
         auto t0 = Clock::now();
         bool halted = false;
+        bool trapped = false;
 
         for (int pos = 0; pos < plen + max_gen; pos++) {
             const double* e = m.emb + ids[pos] * D;
@@ -347,8 +350,9 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (best == m.stop) {
-                    halted = true;
+                if (m.name[best] == "halt" || m.name[best] == "trap") {
+                    halted = m.name[best] == "halt";
+                    trapped = m.name[best] == "trap";
                     break;
                 }
             }
@@ -380,7 +384,22 @@ int main(int argc, char** argv) {
         total_ops += no;
         total_time += dt;
 
-        if (!halted) {
+        if (trace_file) {
+            FILE* out = fopen(trace_file, "wb");
+            if (!out) { fprintf(stderr, "cannot write %s\n", trace_file); return 1; }
+            for (int id : ids) {
+                const auto& token = m.name[id];
+                fprintf(out, "%zu:", token.size());
+                fwrite(token.data(), 1, token.size(), out);
+                fputc('\n', out);
+            }
+            fclose(out);
+        }
+
+        if (trapped) {
+            printf("FAIL execution trapped (%.2fs)\n", dt);
+            failed++;
+        } else if (!halted) {
             printf("FAIL generation limit exhausted without halt (%.2fs)\n", dt);
             failed++;
         } else if (regen) {
