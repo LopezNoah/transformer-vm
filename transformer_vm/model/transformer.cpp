@@ -280,6 +280,7 @@ int main(int argc, char** argv) {
 
         printf("%s: ", test.c_str()); fflush(stdout);
         auto t0 = Clock::now();
+        bool halted = false;
 
         for (int pos = 0; pos < plen + max_gen; pos++) {
             const double* e = m.emb + ids[pos] * D;
@@ -346,7 +347,10 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (best == m.stop) break;
+                if (best == m.stop) {
+                    halted = true;
+                    break;
+                }
             }
         }
 
@@ -376,7 +380,10 @@ int main(int argc, char** argv) {
         total_ops += no;
         total_time += dt;
 
-        if (regen) {
+        if (!halted) {
+            printf("FAIL generation limit exhausted without halt (%.2fs)\n", dt);
+            failed++;
+        } else if (regen) {
             FILE* out = fopen(rp.c_str(), "w");
             if (!out) { fprintf(stderr, "cannot write %s\n", rp.c_str()); continue; }
             bool in_prog = false;
@@ -424,14 +431,10 @@ int main(int argc, char** argv) {
                            mm, m.name[ids[mm]].c_str(), ref[mm].c_str());
                     printf("FAIL (%.2fs)\n", dt);
                     failed++;
-                } else if (nt < (int)ref.size()) {
-                    printf("PASS  %d/%d tok, %d ops in %.2fs (%.0f tok/s) [truncated]\n",
-                           nt, (int)ref.size(), no, dt, dt > 0 ? nt/dt : 0.0);
-                    passed++;
-                } else if (nt > (int)ref.size()) {
-                    printf("PASS  %d tok (ref %d), %d ops in %.2fs (%.0f tok/s) [ref truncated]\n",
-                           nt, (int)ref.size(), no, dt, dt > 0 ? nt/dt : 0.0);
-                    passed++;
+                } else if (nt != (int)ref.size()) {
+                    printf("  MISMATCH: generated %d tokens, expected %d\n", nt, (int)ref.size());
+                    printf("FAIL (%.2fs)\n", dt);
+                    failed++;
                 } else {
                     printf("PASS  %d tok, %d ops in %.2fs (%.0f tok/s)\n",
                            nt, no, dt, dt > 0 ? nt/dt : 0.0);

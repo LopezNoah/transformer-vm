@@ -67,17 +67,21 @@ def run_model_program(
                     ref_tokens[i],
                 )
                 return False, n_tok, n_ops
-        if len(predicted) > len(ref_tokens):
+        if len(predicted) != len(ref_tokens):
             logger.warning(
-                "  MISMATCH at position %d: predicted=%s, expected=<END>",
+                "  MISMATCH: generated %d tokens, expected %d",
+                len(predicted),
                 len(ref_tokens),
-                predicted[len(ref_tokens)],
             )
             return False, n_tok, n_ops
-        if len(predicted) < len(ref_tokens):
-            logger.info("  output truncated: %d/%d tokens", n_tok, len(ref_tokens))
+        if not predicted or predicted[-1] != "halt":
+            logger.warning("  execution did not emit halt before the generation limit")
+            return False, n_tok, n_ops
         return True, n_tok, n_ops
 
+    if not predicted or predicted[-1] != "halt":
+        logger.warning("  execution did not emit halt before the generation limit")
+        return False, n_tok, n_ops
     return True, n_tok, n_ops
 
 

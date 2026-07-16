@@ -136,8 +136,8 @@ def _extract_input(tokens):
 def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=False):
     """Execute a compiled WASM program.
 
-    Returns (instr_count, token_count, output_str) or, if trace=True,
-    (instr_count, token_count, output_str, trace_tokens).
+    Returns (instr_count, token_count, output_str, halted) or, if trace=True,
+    (instr_count, token_count, output_str, halted, trace_tokens).
     """
     mem = bytearray(10 * 1024 * 1024)
 
@@ -156,6 +156,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
     token_count = 0
     output = []
     trace_tokens = [] if trace else None
+    halted = False
 
     while pc < len(program) and token_count < max_tokens:
         op, imm = program[pc]
@@ -177,6 +178,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
             token_count += 1
             if trace:
                 trace_tokens.append("halt")
+            halted = True
             break
 
         elif op == "i32.const":
@@ -544,7 +546,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
         else:
             raise RuntimeError(f"Unknown op: {op} at pc={pc}")
 
-    result = (instr_count, token_count, "".join(output))
+    result = (instr_count, token_count, "".join(output), halted)
     if trace:
         return result + (trace_tokens,)
     return result
@@ -607,9 +609,13 @@ def generate_ref(prog_path, ref_path=None, max_tokens=100_000_000):
     if ref_path is None:
         ref_path = prog_path.replace(".txt", "_ref.txt")
     program, input_str = load_program(prog_path)
-    _instrs, token_count, output, trace_tokens = run(
+    _instrs, token_count, output, halted, trace_tokens = run(
         program, input_str, max_tokens=max_tokens, trace=True
     )
+    if not halted:
+        raise RuntimeError(
+            f"Reference execution did not emit halt before ending or reaching the {max_tokens}-token limit"
+        )
     formatted = format_trace(prog_path, trace_tokens)
     with open(ref_path, "w") as f:
         f.write(formatted)

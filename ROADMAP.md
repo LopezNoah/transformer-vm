@@ -46,11 +46,11 @@ Relevant code: `transformer_vm/compilation/lower.py`,
 
 ### COR-004: Require complete execution
 
-- [ ] Require generated output to exactly match reference length.
-- [ ] Require every successful execution to emit `halt`.
-- [ ] Treat generation-limit exhaustion as a failure.
-- [ ] Prevent truncated reference traces from being saved as authoritative.
-- [ ] Apply the same rules in Python, graph, and C++ execution paths.
+- [x] Require generated output to exactly match reference length.
+- [x] Require every successful execution to emit `halt`.
+- [x] Treat generation-limit exhaustion as a failure.
+- [x] Prevent truncated reference traces from being saved as authoritative.
+- [x] Apply the same rules in Python, graph, and C++ execution paths.
 
 Relevant code: `transformer_vm/runner.py`, `transformer_vm/evaluator.py`,
 `transformer_vm/wasm/reference.py`, `transformer_vm/model/transformer.cpp`
