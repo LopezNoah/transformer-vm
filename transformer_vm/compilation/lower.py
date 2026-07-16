@@ -632,10 +632,9 @@ def _expand_shl(c: int, local_a: int) -> list[WasmInstr]:
     zero SCRATCH, store x at SCRATCH+q, load from SCRATCH gives x << (q*8).
     Then apply remaining r doublings (c = 8*q + r).
     """
+    c &= 31
     if c == 0:
         return [_instr(OP_LOCAL_GET, local_a)]
-    if c >= 32:
-        return [_instr(OP_I32_CONST, 0)]
 
     q, r = divmod(c, 8)
 
@@ -670,10 +669,9 @@ def _expand_shl_from_stack(c: int, local_a: int) -> list[WasmInstr]:
     Uses local.tee to avoid redundant set+get, saving 2 instructions
     vs the set + _expand_shl approach for small shifts.
     """
+    c &= 31
     if c == 0:
         return []
-    if c >= 32:
-        return [_instr(OP_DROP), _instr(OP_I32_CONST, 0)]
 
     q, r = divmod(c, 8)
 
@@ -698,8 +696,9 @@ def _expand_shr_u(c: int, local_a: int) -> list[WasmInstr]:
     store x at SCRATCH, zero SCRATCH+4, load from SCRATCH+q gives x >> (q*8).
     Then apply remaining r-bit shift via division loop (c = 8*q + r).
     """
-    if c >= 32:
-        return [_instr(OP_DROP), _instr(OP_I32_CONST, 0)]
+    c &= 31
+    if c == 0:
+        return []
 
     q, r = divmod(c, 8)
 
@@ -875,6 +874,119 @@ def _expand_bitop_general(op: str, c: int, local_a: int) -> list[WasmInstr]:
         _instr(OP_I32_LOAD, 0, 0),
     ]
     return instrs
+
+
+def _emit_variable_byte_bitop(
+    op: str, local_left: int, local_right: int, local_result: int, local_bit: int
+) -> list[WasmInstr]:
+    """Apply a bitwise operation to two byte locals using basic instructions."""
+    instrs: list[WasmInstr] = [
+        _instr(OP_I32_CONST, 0),
+        _instr(OP_LOCAL_SET, local_result),
+    ]
+
+    for i in range(7, -1, -1):
+        value = 1 << i
+        # Consume each set bit so subsequent comparisons inspect the next bit.
+        instrs += [
+            _instr(OP_LOCAL_GET, local_left),
+            _instr(OP_I32_CONST, value),
+            _instr(OP_I32_GE_U),
+            _instr(OP_LOCAL_SET, local_bit),
+            _instr(OP_LOCAL_GET, local_bit),
+            _instr(OP_IF, 0x40),
+            _instr(OP_LOCAL_GET, local_left),
+            _instr(OP_I32_CONST, value),
+            _instr(OP_I32_SUB),
+            _instr(OP_LOCAL_SET, local_left),
+            _instr(OP_END),
+            _instr(OP_LOCAL_GET, local_right),
+            _instr(OP_I32_CONST, value),
+            _instr(OP_I32_GE_U),
+            _instr(OP_IF, 0x40),
+            _instr(OP_LOCAL_GET, local_right),
+            _instr(OP_I32_CONST, value),
+            _instr(OP_I32_SUB),
+            _instr(OP_LOCAL_SET, local_right),
+        ]
+        if op == "and":
+            instrs += [
+                _instr(OP_LOCAL_GET, local_bit),
+                _instr(OP_IF, 0x40),
+                _instr(OP_LOCAL_GET, local_result),
+                _instr(OP_I32_CONST, value),
+                _instr(OP_I32_ADD),
+                _instr(OP_LOCAL_SET, local_result),
+                _instr(OP_END),
+            ]
+        elif op == "or":
+            instrs += [
+                _instr(OP_LOCAL_GET, local_result),
+                _instr(OP_I32_CONST, value),
+                _instr(OP_I32_ADD),
+                _instr(OP_LOCAL_SET, local_result),
+            ]
+        else:  # xor
+            instrs += [
+                _instr(OP_LOCAL_GET, local_bit),
+                _instr(OP_I32_EQZ),
+                _instr(OP_IF, 0x40),
+                _instr(OP_LOCAL_GET, local_result),
+                _instr(OP_I32_CONST, value),
+                _instr(OP_I32_ADD),
+                _instr(OP_LOCAL_SET, local_result),
+                _instr(OP_END),
+            ]
+        instrs.append(_instr(OP_ELSE))
+        if op in ("or", "xor"):
+            instrs += [
+                _instr(OP_LOCAL_GET, local_bit),
+                _instr(OP_IF, 0x40),
+                _instr(OP_LOCAL_GET, local_result),
+                _instr(OP_I32_CONST, value),
+                _instr(OP_I32_ADD),
+                _instr(OP_LOCAL_SET, local_result),
+                _instr(OP_END),
+            ]
+        instrs.append(_instr(OP_END))
+    return instrs
+
+
+def _expand_bitop_variable(op: str, local_a: int) -> list[WasmInstr]:
+    """Expand variable-operand i32.and, i32.or, or i32.xor exactly."""
+    local_left = local_a
+    local_right = local_a + 1
+    local_result = local_a + 2
+    local_bit = local_a + 3
+    instrs: list[WasmInstr] = [
+        _instr(OP_LOCAL_SET, local_right),
+        _instr(OP_LOCAL_SET, local_left),
+        _instr(OP_I32_CONST, SCRATCH_ADDR),
+        _instr(OP_LOCAL_GET, local_left),
+        _instr(OP_I32_STORE, 0, 0),
+        _instr(OP_I32_CONST, SCRATCH_ADDR),
+        _instr(OP_LOCAL_GET, local_right),
+        _instr(OP_I32_STORE, 0, 4),
+    ]
+    for byte_offset in range(4):
+        instrs += [
+            _instr(OP_I32_CONST, SCRATCH_ADDR),
+            _instr(OP_I32_LOAD8_U, 0, byte_offset),
+            _instr(OP_LOCAL_SET, local_left),
+            _instr(OP_I32_CONST, SCRATCH_ADDR),
+            _instr(OP_I32_LOAD8_U, 0, byte_offset + 4),
+            _instr(OP_LOCAL_SET, local_right),
+        ]
+        instrs += _emit_variable_byte_bitop(op, local_left, local_right, local_result, local_bit)
+        instrs += [
+            _instr(OP_I32_CONST, SCRATCH_ADDR),
+            _instr(OP_LOCAL_GET, local_result),
+            _instr(OP_I32_STORE8, 0, byte_offset),
+        ]
+    return instrs + [
+        _instr(OP_I32_CONST, SCRATCH_ADDR),
+        _instr(OP_I32_LOAD, 0, 0),
+    ]
 
 
 def _expand_and_general(c: int, local_a: int) -> list[WasmInstr]:
@@ -1074,21 +1186,12 @@ def _find_const_locals(instrs) -> dict[int, int]:
 def _expand_shr_s(c: int, local_a: int) -> list[WasmInstr]:
     """Expand signed x >> C using memory byte extraction.
 
-    For byte-aligned shifts, uses i32.load8_s / i32.load16_s to get the
-    correct sign-extended result.  Falls back to unsigned shift for other cases.
+    For byte-aligned shifts, uses signed loads. Other counts use a logical
+    shift followed by an explicit sign fill.
     """
+    c &= 31
     if c == 0:
         return []
-    if c >= 32:
-        return [
-            _instr(OP_LOCAL_SET, local_a),
-            _instr(OP_I32_CONST, -1),
-            _instr(OP_I32_CONST, 0),
-            _instr(OP_LOCAL_GET, local_a),
-            _instr(OP_I32_CONST, 0),
-            _instr(OP_I32_LT_S),
-            _instr(OP_SELECT),
-        ]
 
     q, r = divmod(c, 8)
 
@@ -1137,23 +1240,51 @@ def _expand_shr_s(c: int, local_a: int) -> list[WasmInstr]:
                 _instr(OP_LOCAL_GET, local_tmp),
             ]
 
-    if q > 0:
-        instrs = [
-            _instr(OP_LOCAL_SET, local_a),
-            _instr(OP_I32_CONST, SCRATCH_ADDR),
-            _instr(OP_LOCAL_GET, local_a),
-            _instr(OP_I32_STORE, 0, 0),
-            _instr(OP_I32_CONST, SCRATCH_ADDR),
-            _instr(OP_I32_CONST, 0),
-            _instr(OP_I32_STORE, 0, 4),
-            _instr(OP_I32_CONST, SCRATCH_ADDR),
-            _instr(OP_I32_LOAD, 0, q),
-        ]
-        if r > 0:
-            instrs.extend(_expand_div_u(1 << r, local_a))
-        return instrs
+    local_x = local_a
+    local_result = local_a + 1
+    local_work = local_a + 2
+    sign_fill = (-1 << (32 - c)) & 0xFFFFFFFF
+    return [
+        _instr(OP_LOCAL_SET, local_x),
+        _instr(OP_LOCAL_GET, local_x),
+        *_expand_shr_u(c, local_work),
+        _instr(OP_LOCAL_SET, local_result),
+        _instr(OP_BLOCK, 0x40),
+        _instr(OP_LOCAL_GET, local_x),
+        _instr(OP_I32_CONST, 0),
+        _instr(OP_I32_GE_S),
+        _instr(OP_BR_IF, 0),
+        _instr(OP_LOCAL_GET, local_result),
+        *_expand_or(sign_fill, local_work),
+        _instr(OP_LOCAL_SET, local_result),
+        _instr(OP_END),
+        _instr(OP_LOCAL_GET, local_result),
+    ]
 
-    return _expand_div_u(1 << c, local_a)
+
+def _mask_shift_count(local_count: int, local_byte: int) -> list[WasmInstr]:
+    """Replace a shift count with its low five bits using bounded byte arithmetic."""
+    return [
+        _instr(OP_I32_CONST, SCRATCH_ADDR),
+        _instr(OP_LOCAL_GET, local_count),
+        _instr(OP_I32_STORE8, 0, 0),
+        _instr(OP_I32_CONST, SCRATCH_ADDR),
+        _instr(OP_I32_LOAD8_U, 0, 0),
+        _instr(OP_LOCAL_SET, local_count),
+        _instr(OP_BLOCK, 0x40),
+        _instr(OP_LOOP, 0x40),
+        _instr(OP_LOCAL_GET, local_count),
+        _instr(OP_I32_CONST, 32),
+        _instr(OP_I32_LT_U),
+        _instr(OP_BR_IF, 1),
+        _instr(OP_LOCAL_GET, local_count),
+        _instr(OP_I32_CONST, 32),
+        _instr(OP_I32_SUB),
+        _instr(OP_LOCAL_SET, local_count),
+        _instr(OP_BR, 0),
+        _instr(OP_END),
+        _instr(OP_END),
+    ]
 
 
 def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
@@ -1180,12 +1311,12 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
 
     const_locals = _find_const_locals(instrs)
 
-    # Allocate temporary locals (4 i32 temps should suffice)
-    NUM_TEMPS = 4
+    # Signed shifts need three scratch locals for the sign-fill bitwise expansion.
+    NUM_TEMPS = 5
     total_existing = num_params + func.num_locals
     temp_base = total_existing  # first temp local index
 
-    new_locals = list(func.locals) + [(NUM_TEMPS, 0x7F)]  # 4 x i32
+    new_locals = list(func.locals) + [(NUM_TEMPS, 0x7F)]  # temporary i32 locals
     new_num_locals = func.num_locals + NUM_TEMPS
 
     # Build new instruction list
@@ -1279,6 +1410,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
                 [
                     _instr(OP_LOCAL_SET, local_b),  # save shift amount
                     _instr(OP_LOCAL_SET, local_a),  # save value
+                    *_mask_shift_count(local_b, temp_base + 2),
                     _instr(OP_BLOCK, 0x40),  # block $exit
                     _instr(OP_LOOP, 0x40),  #   loop $loop
                     _instr(OP_LOCAL_GET, local_b),
@@ -1312,6 +1444,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
                 [
                     _instr(OP_LOCAL_SET, local_b),  # save shift amount
                     _instr(OP_LOCAL_SET, local_a),  # save value
+                    *_mask_shift_count(local_b, local_q),
                     _instr(OP_BLOCK, 0x40),  # block $outer
                     _instr(OP_LOOP, 0x40),  #   loop $outer_loop
                     _instr(OP_LOCAL_GET, local_b),
@@ -1353,21 +1486,26 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
             lowered_count += 1
             continue
 
-        # Runtime SHR_S (no preceding const): treat as SHR_U for now
-        # (correct for non-negative values; varargs shifts are typically small)
+        # Runtime SHR_S (no preceding const): arithmetic right shift.
         if ins.opcode == OP_I32_SHR_S:
             local_a = temp_base
             local_b = temp_base + 1
             local_q = temp_base + 2
+            local_sign = temp_base + 3
             new_instrs.extend(
                 [
                     _instr(OP_LOCAL_SET, local_b),
                     _instr(OP_LOCAL_SET, local_a),
+                    *_mask_shift_count(local_b, local_q),
                     _instr(OP_BLOCK, 0x40),
                     _instr(OP_LOOP, 0x40),
                     _instr(OP_LOCAL_GET, local_b),
                     _instr(OP_I32_EQZ),
                     _instr(OP_BR_IF, 1),
+                    _instr(OP_LOCAL_GET, local_a),
+                    _instr(OP_I32_CONST, 0),
+                    _instr(OP_I32_LT_S),
+                    _instr(OP_LOCAL_SET, local_sign),
                     _instr(OP_I32_CONST, 0),
                     _instr(OP_LOCAL_SET, local_q),
                     _instr(OP_BLOCK, 0x40),
@@ -1389,6 +1527,15 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
                     _instr(OP_END),
                     _instr(OP_LOCAL_GET, local_q),
                     _instr(OP_LOCAL_SET, local_a),
+                    _instr(OP_BLOCK, 0x40),
+                    _instr(OP_LOCAL_GET, local_sign),
+                    _instr(OP_I32_EQZ),
+                    _instr(OP_BR_IF, 0),
+                    _instr(OP_LOCAL_GET, local_a),
+                    _instr(OP_I32_CONST, -2147483648),
+                    _instr(OP_I32_ADD),
+                    _instr(OP_LOCAL_SET, local_a),
+                    _instr(OP_END),
                     _instr(OP_LOCAL_GET, local_b),
                     _instr(OP_I32_CONST, 1),
                     _instr(OP_I32_SUB),
@@ -1501,39 +1648,21 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
             lowered_count += 1
             continue
 
-        # Runtime XOR (no preceding const): approximate as NE (0 or 1)
+        # Runtime bitwise operations with two variable operands.
         if ins.opcode == OP_I32_XOR:
-            new_instrs.append(_instr(OP_I32_NE))
+            new_instrs.extend(_expand_bitop_variable("xor", temp_base))
             i += 1
             lowered_count += 1
             continue
 
-        # Runtime AND (no preceding const): a b i32.and → select(a, 0, b)
         if ins.opcode == OP_I32_AND:
-            local_a = temp_base
-            new_instrs.extend(
-                [
-                    _instr(OP_LOCAL_SET, local_a),  # save b
-                    _instr(OP_I32_CONST, 0),  # push 0
-                    _instr(OP_LOCAL_GET, local_a),  # push b (condition)
-                    _instr(OP_SELECT),  # if b != 0: a, else: 0
-                ]
-            )
+            new_instrs.extend(_expand_bitop_variable("and", temp_base))
             i += 1
             lowered_count += 1
             continue
 
-        # Runtime OR (no preceding const): a b i32.or → select(1, a, b)
         if ins.opcode == OP_I32_OR:
-            local_a = temp_base
-            new_instrs.extend(
-                [
-                    _instr(OP_LOCAL_SET, local_a),  # save b
-                    _instr(OP_I32_CONST, 1),  # push 1
-                    _instr(OP_LOCAL_GET, local_a),  # push b (condition)
-                    _instr(OP_SELECT),  # if b != 0: 1, else: a
-                ]
-            )
+            new_instrs.extend(_expand_bitop_variable("or", temp_base))
             i += 1
             lowered_count += 1
             continue
@@ -1625,7 +1754,8 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
                 [
                     _instr(OP_LOCAL_SET, local_b),
                     _instr(OP_LOCAL_SET, local_a),
-                    # b = b mod 32
+                    *_mask_shift_count(local_b, temp_base + 3),
+                    # The count is already reduced to its low five bits.
                     _instr(OP_BLOCK, 0x40),
                     _instr(OP_LOOP, 0x40),
                     _instr(OP_LOCAL_GET, local_b),
@@ -1681,7 +1811,8 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
                 [
                     _instr(OP_LOCAL_SET, local_b),
                     _instr(OP_LOCAL_SET, local_a),
-                    # b = b mod 32
+                    *_mask_shift_count(local_b, temp_base + 3),
+                    # The count is already reduced to its low five bits.
                     _instr(OP_BLOCK, 0x40),
                     _instr(OP_LOOP, 0x40),
                     _instr(OP_LOCAL_GET, local_b),
