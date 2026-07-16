@@ -119,6 +119,14 @@ OPCODES = {
     "i32.ge_u": 0x4F,
     "i32.add": 0x6A,
     "i32.sub": 0x6B,
+    "i32.and": 0x71,
+    "i32.or": 0x72,
+    "i32.xor": 0x73,
+    "i32.shl": 0x74,
+    "i32.shr_s": 0x75,
+    "i32.shr_u": 0x76,
+    "i32.rotl": 0x77,
+    "i32.rotr": 0x78,
     "output": 0xFF,
     "input_base": 0xFE,
 }
@@ -134,6 +142,14 @@ STACK_DELTA = {
     "drop": -1,
     "i32.add": -1,
     "i32.sub": -1,
+    "i32.and": -1,
+    "i32.or": -1,
+    "i32.xor": -1,
+    "i32.shl": -1,
+    "i32.shr_s": -1,
+    "i32.shr_u": -1,
+    "i32.rotl": -1,
+    "i32.rotr": -1,
     "i32.eqz": 0,
     "i32.gt_s": -1,
     "i32.gt_u": -1,
@@ -172,6 +188,14 @@ STS_OPS = {
     "i32.const",
     "i32.add",
     "i32.sub",
+    "i32.and",
+    "i32.or",
+    "i32.xor",
+    "i32.shl",
+    "i32.shr_s",
+    "i32.shr_u",
+    "i32.rotl",
+    "i32.rotr",
     "i32.eqz",
     "select",
     "i32.gt_s",
@@ -222,6 +246,7 @@ def build(program=None):
         return _is_op_cache[op]
 
     byte_number = InputDimension("byte_number")
+    byte_bits = [InputDimension(f"byte_bit_{i}") for i in range(8)]
     carry = InputDimension("carry")
     delta_cursor = InputDimension("delta_cursor")
     delta_stack = InputDimension("delta_stack")
@@ -241,7 +266,9 @@ def build(program=None):
     # ── Build input_tokens ───────────────────────────────────────────
     input_tokens = (
         {
-            (f"{bv:02x}'" if c else f"{bv:02x}"): (bv + 1) * byte_number + c * carry
+            (f"{bv:02x}'" if c else f"{bv:02x}"): (bv + 1) * byte_number
+            + sum(((bv >> i) & 1) * byte_bits[i] for i in range(8))
+            + c * carry
             for bv in range(256)
             for c in range(2)
         }
@@ -417,6 +444,8 @@ def build(program=None):
     top_byte = fetch(byte_number - 1, query=stack_top_position + byte_index, key=position)
     second_byte = fetch(byte_number - 1, query=stack_second_position + byte_index, key=position)
     third_byte = fetch(byte_number - 1, query=stack_third_position + byte_index, key=position)
+    top_bits = fetch(byte_bits, query=stack_top_position + byte_index, key=position)
+    second_bits = fetch(byte_bits, query=stack_second_position + byte_index, key=position)
 
     # ── Memory ───────────────────────────────────────────────────────
     memory_read_address = stack_top_value + immediate + byte_index
@@ -446,6 +475,98 @@ def build(program=None):
     sub_value = second_byte - top_byte - carry_late
     sub_borrow = 1 - stepglu(one, sub_value)
     sub_byte = sub_value + 256 * sub_borrow
+
+    # Native crypto arithmetic works directly on the bit embeddings carried by
+    # byte tokens, avoiding the long instruction traces produced by lowering.
+    bit_and = [reglu(second_bits[i], top_bits[i]) for i in range(8)]
+    and_byte = sum((1 << i) * bit_and[i] for i in range(8))
+    or_byte = sum((1 << i) * (second_bits[i] + top_bits[i] - bit_and[i]) for i in range(8))
+    xor_byte = sum(
+        (1 << i) * (second_bits[i] + top_bits[i] - 2 * bit_and[i]) for i in range(8)
+    )
+
+    count_bits = fetch(byte_bits[:5], query=stack_top_position, key=position)
+    count_low = count_bits[0] + 2 * count_bits[1] + 4 * count_bits[2]
+    count_high = count_bits[3] + 2 * count_bits[4]
+    count_value = count_low + 8 * count_high
+    count_selectors = []
+    for count in range(8):
+        selector = one
+        for bit in range(3):
+            expected = (count >> bit) & 1
+            selector = reglu(selector, count_bits[bit] if expected else 1 - count_bits[bit])
+        count_selectors.append(selector)
+
+    def select_shift_bits(current, neighbor, left):
+        result = []
+        for output_bit in range(8):
+            choices = []
+            for count in range(8):
+                source_bit = output_bit - count if left else output_bit + count
+                if source_bit < 0:
+                    source = neighbor[8 + source_bit]
+                elif source_bit >= 8:
+                    source = neighbor[source_bit - 8]
+                else:
+                    source = current[source_bit]
+                choices.append(reglu(source, count_selectors[count]))
+            result.append(sum(choices))
+        return result
+
+    left_byte = byte_index - count_high
+    shl_current = fetch(byte_bits, query=stack_second_position + left_byte, key=position)
+    shl_previous = fetch(byte_bits, query=stack_second_position + left_byte - 1, key=position)
+    shl_bits = select_shift_bits(shl_current, shl_previous, left=True)
+
+    right_byte = byte_index + count_high
+    shr_current = fetch(byte_bits, query=stack_second_position + right_byte, key=position)
+    shr_next = fetch(byte_bits, query=stack_second_position + right_byte + 1, key=position)
+    shr_bits = select_shift_bits(shr_current, shr_next, left=False)
+
+    rotl_wrap = stepglu(one, count_high - byte_index - 1)
+    rotl_previous_wrap = stepglu(one, count_high - byte_index)
+    rotl_current = fetch(
+        byte_bits,
+        query=stack_second_position + left_byte + 4 * rotl_wrap,
+        key=position,
+    )
+    rotl_previous = fetch(
+        byte_bits,
+        query=stack_second_position + left_byte - 1 + 4 * rotl_previous_wrap,
+        key=position,
+    )
+    rotl_bits = select_shift_bits(rotl_current, rotl_previous, left=True)
+
+    rotr_wrap = stepglu(one, right_byte - 4)
+    rotr_next_wrap = stepglu(one, right_byte - 3)
+    rotr_current = fetch(
+        byte_bits,
+        query=stack_second_position + right_byte - 4 * rotr_wrap,
+        key=position,
+    )
+    rotr_next = fetch(
+        byte_bits,
+        query=stack_second_position + right_byte + 1 - 4 * rotr_next_wrap,
+        key=position,
+    )
+    rotr_bits = select_shift_bits(rotr_current, rotr_next, left=False)
+
+    source_sign = fetch(byte_bits[7], query=stack_second_position + 3, key=position)
+    shl_value = 0
+    shr_u_value = 0
+    shr_s_value = 0
+    rotl_value = 0
+    rotr_value = 0
+    for bit in range(8):
+        shl_valid = stepglu(one, 8 * byte_index + bit - count_value)
+        shr_valid = stepglu(one, 31 - 8 * byte_index - bit - count_value)
+        shl_value += (1 << bit) * reglu(shl_bits[bit], shl_valid)
+        shr_u_value += (1 << bit) * reglu(shr_bits[bit], shr_valid)
+        shr_s_value += (1 << bit) * (
+            reglu(shr_bits[bit], shr_valid) + reglu(source_sign, 1 - shr_valid)
+        )
+        rotl_value += (1 << bit) * rotl_bits[bit]
+        rotr_value += (1 << bit) * rotr_bits[bit]
 
     # ── Comparisons ──────────────────────────────────────────────────
     a_gt_b_u = stepglu(one, stack_second_value - stack_top_value - 1)
@@ -513,6 +634,14 @@ def build(program=None):
         reglu(branch_sub_val, op_dot("i32.const"))
         + reglu(add_byte, op_dot("i32.add"))
         + reglu(sub_byte, op_dot("i32.sub"))
+        + reglu(and_byte, op_dot("i32.and"))
+        + reglu(or_byte, op_dot("i32.or"))
+        + reglu(xor_byte, op_dot("i32.xor"))
+        + reglu(shl_value, op_dot("i32.shl"))
+        + reglu(shr_s_value, op_dot("i32.shr_s"))
+        + reglu(shr_u_value, op_dot("i32.shr_u"))
+        + reglu(rotl_value, op_dot("i32.rotl"))
+        + reglu(rotr_value, op_dot("i32.rotr"))
         + result_byte_early
         + reglu(memory_byte, op_dot("i32.load"))
         + reglu(memory_byte, op_dot("i32.load8_u") + is_boundary - 1)

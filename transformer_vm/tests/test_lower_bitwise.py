@@ -221,7 +221,7 @@ def test_variable_bitops_match_node_wasm_runtime():
     expected = _node_results({name: _wasm_bitop(opcode) for name, opcode in OPCODES.items()})
     for name, opcode in OPCODES.items():
         original = decode(_wasm_bitop(opcode)).functions[0]
-        lowered = lower_hard_ops(original, num_params=2)
+        lowered = lower_hard_ops(original, num_params=2, native_crypto=False)
         assert check_basic_only(lowered) == {}
         actual = [_run_lowered(lowered, left, right) for left in EDGE_VALUES for right in EDGE_VALUES]
         assert actual == expected[name]
@@ -235,7 +235,7 @@ def test_shift_and_rotate_lowering_matches_node_wasm_runtime():
     expected = _node_results(originals, left_inputs, SHIFT_COUNTS)
     for name, original_wasm in originals.items():
         original = decode(original_wasm).functions[0]
-        lowered = lower_hard_ops(original, num_params=2)
+        lowered = lower_hard_ops(original, num_params=2, native_crypto=False)
         assert check_basic_only(lowered) == {}
         actual = _node_results({name: _lowered_wasm(lowered)}, left_inputs, SHIFT_COUNTS)[name]
         assert actual == expected[name]
@@ -246,7 +246,7 @@ def test_signed_right_shift_const_preserves_high_bit():
     """The byte-aligned signed expansion sign-extends negative i32 values."""
     original_wasm = _wasm_const_shift(OP_I32_SHR_S, 8)
     original = decode(original_wasm).functions[0]
-    lowered = lower_hard_ops(original, num_params=2)
+    lowered = lower_hard_ops(original, num_params=2, native_crypto=False)
     assert check_basic_only(lowered) == {}
     inputs = [0x80000000, 0xFFFFFFFF]
     expected = _node_results({"shr_s": original_wasm}, inputs)

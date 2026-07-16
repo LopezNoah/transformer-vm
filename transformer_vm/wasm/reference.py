@@ -284,6 +284,43 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
                 trace_tokens.append(_commit(-1, 1, 0))
             pc += 1
 
+        elif op in {
+            "i32.and",
+            "i32.or",
+            "i32.xor",
+            "i32.shl",
+            "i32.shr_s",
+            "i32.shr_u",
+            "i32.rotl",
+            "i32.rotr",
+        }:
+            bv = stack.pop() & MASK32
+            av = stack.pop() & MASK32
+            if op == "i32.and":
+                result = av & bv
+            elif op == "i32.or":
+                result = av | bv
+            elif op == "i32.xor":
+                result = av ^ bv
+            else:
+                shift = bv & 31
+                if op == "i32.shl":
+                    result = (av << shift) & MASK32
+                elif op == "i32.shr_s":
+                    result = (to_signed(av) >> shift) & MASK32
+                elif op == "i32.shr_u":
+                    result = av >> shift
+                elif op == "i32.rotl":
+                    result = ((av << shift) | (av >> ((32 - shift) & 31))) & MASK32
+                else:
+                    result = ((av >> shift) | (av << ((32 - shift) & 31))) & MASK32
+            stack.append(result)
+            token_count += 5
+            if trace:
+                trace_tokens.extend(_byte_tokens(result, 4))
+                trace_tokens.append(_commit(-1, 1, 0))
+            pc += 1
+
         elif op == "i32.eqz":
             v = stack.pop()
             result = 1 if v == 0 else 0

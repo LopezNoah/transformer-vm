@@ -104,12 +104,12 @@ handling production secrets.
 
 Depends on: `COR-001`, `COR-002`, `COR-005`
 
-- [ ] Add tested add-with-carry and subtract-with-borrow helpers.
-- [ ] Add efficient native XOR, AND, OR, shift, and rotate VM operations.
-- [ ] Add explicit little-endian and big-endian load/store helpers.
-- [ ] Add constant-selection functionality without relying on Boolean-only bitwise lowering.
-- [ ] Verify exact 32-bit modular overflow behavior.
-- [ ] Measure token-count changes against lowered implementations.
+- [x] Add tested add-with-carry and subtract-with-borrow helpers.
+- [x] Add efficient native XOR, AND, OR, shift, and rotate VM operations.
+- [x] Add explicit little-endian and big-endian load/store helpers.
+- [x] Add constant-selection functionality without relying on Boolean-only bitwise lowering.
+- [x] Verify exact 32-bit modular overflow behavior.
+- [x] Measure token-count changes against lowered implementations.
 
 ### CRYPTO-002: Support binary-safe inputs and outputs
 

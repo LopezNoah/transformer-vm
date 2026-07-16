@@ -27,6 +27,67 @@ void putchar(int ch);
 /* ── Helpers ────────────────────────────────────────────────────── */
 
 __attribute__((always_inline))
+static inline unsigned int tvm_addcarry_u32(unsigned int a, unsigned int b,
+                                             unsigned int carry_in,
+                                             unsigned int *carry_out) {
+    unsigned int sum = a + b;
+    unsigned int carry = sum < a;
+    unsigned int carry_bit = carry_in != 0u;
+    unsigned int result = sum + carry_bit;
+    *carry_out = carry | (result < sum);
+    return result;
+}
+
+__attribute__((always_inline))
+static inline unsigned int tvm_subborrow_u32(unsigned int a, unsigned int b,
+                                              unsigned int borrow_in,
+                                              unsigned int *borrow_out) {
+    unsigned int difference = a - b;
+    unsigned int borrow = a < b;
+    unsigned int borrow_bit = borrow_in != 0u;
+    unsigned int result = difference - borrow_bit;
+    *borrow_out = borrow | (difference < borrow_bit);
+    return result;
+}
+
+__attribute__((always_inline))
+static inline unsigned int tvm_load32_le(const unsigned char *p) {
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
+           ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+__attribute__((always_inline))
+static inline unsigned int tvm_load32_be(const unsigned char *p) {
+    return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16) |
+           ((unsigned int)p[2] << 8) | (unsigned int)p[3];
+}
+
+__attribute__((always_inline))
+static inline void tvm_store32_le(unsigned char *p, unsigned int value) {
+    p[0] = (unsigned char)value;
+    p[1] = (unsigned char)(value >> 8);
+    p[2] = (unsigned char)(value >> 16);
+    p[3] = (unsigned char)(value >> 24);
+}
+
+__attribute__((always_inline))
+static inline void tvm_store32_be(unsigned char *p, unsigned int value) {
+    p[0] = (unsigned char)(value >> 24);
+    p[1] = (unsigned char)(value >> 16);
+    p[2] = (unsigned char)(value >> 8);
+    p[3] = (unsigned char)value;
+}
+
+/* Branchless word selection. This does not make VM execution constant-time. */
+__attribute__((always_inline))
+static inline unsigned int tvm_select_u32(unsigned int when_true,
+                                           unsigned int when_false,
+                                           unsigned int condition) {
+    unsigned int mask = 0u - (condition != 0u);
+    return (when_true & mask) | (when_false & ~mask);
+}
+
+__attribute__((always_inline))
 static inline int str_len(const char *s) {
     int n = 0;
     while (s[n]) n++;

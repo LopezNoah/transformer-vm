@@ -135,6 +135,14 @@ BASIC_OPS = _CONTROL_OPS | frozenset(
         OP_I32_GE_U,
         OP_I32_ADD,
         OP_I32_SUB,
+        OP_I32_AND,
+        OP_I32_OR,
+        OP_I32_XOR,
+        OP_I32_SHL,
+        OP_I32_SHR_S,
+        OP_I32_SHR_U,
+        OP_I32_ROTL,
+        OP_I32_ROTR,
     }
 )
 
@@ -1287,7 +1295,7 @@ def _mask_shift_count(local_count: int, local_byte: int) -> list[WasmInstr]:
     ]
 
 
-def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
+def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = True) -> FuncBody:
     """Lower hard-to-simulate instructions in a function body.
 
     Returns a new FuncBody with hard ops replaced by basic instruction
@@ -1296,13 +1304,26 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
     Args:
         func: The original function body.
         num_params: Number of function parameters (local indices start after these).
+        native_crypto: Preserve native bitwise, shift, and rotate instructions. Set
+            to false only to compare against the legacy lowered implementation.
     """
     instrs = func.instructions
     needs_lowering = False
 
     # Check if any lowering is needed
+    native_ops = {
+        OP_I32_AND,
+        OP_I32_OR,
+        OP_I32_XOR,
+        OP_I32_SHL,
+        OP_I32_SHR_S,
+        OP_I32_SHR_U,
+        OP_I32_ROTL,
+        OP_I32_ROTR,
+    }
+    lowerable_binops = LOWERABLE_BINOPS - native_ops if native_crypto else LOWERABLE_BINOPS
     for ins in instrs:
-        if ins.opcode in LOWERABLE_BINOPS or ins.opcode in LOWERABLE_UNARY:
+        if ins.opcode in lowerable_binops or ins.opcode in LOWERABLE_UNARY:
             needs_lowering = True
             break
 
@@ -1334,7 +1355,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
         if (
             ins.opcode == OP_I32_CONST
             and i + 1 < len(instrs)
-            and instrs[i + 1].opcode in LOWERABLE_BINOPS
+            and instrs[i + 1].opcode in lowerable_binops
         ):
             const_val = ins.immediates[0] & 0xFFFFFFFF
             binop_idx = i + 1
@@ -1342,7 +1363,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0) -> FuncBody:
             ins.opcode == OP_LOCAL_GET
             and ins.immediates[0] in const_locals
             and i + 1 < len(instrs)
-            and instrs[i + 1].opcode in LOWERABLE_BINOPS
+            and instrs[i + 1].opcode in lowerable_binops
         ):
             const_val = const_locals[ins.immediates[0]] & 0xFFFFFFFF
             binop_idx = i + 1
