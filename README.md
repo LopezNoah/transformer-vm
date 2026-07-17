@@ -280,6 +280,12 @@ Unsupported (lowered at compile time): MUL, DIV, MOD, AND, OR, XOR, SHL, SHR.
 These are expanded into sequences of supported ops by `transformer_vm/compilation/lower.py`.
 The lowerer handles both constant and variable operands.
 
+`i64` values are legalized before lowering as two stack cells in `(low32, high32)`
+order. i64 linear-memory values remain eight little-endian bytes. The current
+legalizer supports constants, locals, direct internal calls, add/subtract,
+comparisons, bitwise operations, shifts, rotates, scalar loads/stores, and
+i32/i64 conversions.
+
 ## Example: Sudoku
 
 The `transformer_vm/examples/sudoku.c` file implements a Norvig-style constraint-propagation
@@ -298,4 +304,3 @@ uv run wasm-run transformer_vm/data/sudoku.txt
 The Sudoku solver demonstrates the system's ability to handle complex,
 real-world algorithms with deep call stacks, extensive memory operations,
 and long execution traces (~900K tokens, solved at ~30K tok/s).
-

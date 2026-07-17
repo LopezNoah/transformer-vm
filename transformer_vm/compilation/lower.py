@@ -66,7 +66,51 @@ from .decoder import (
     OP_I32_STORE8,
     OP_I32_STORE16,
     OP_I32_SUB,
+    OP_I32_WRAP_I64,
     OP_I32_XOR,
+    OP_I64_ADD,
+    OP_I64_AND,
+    OP_I64_CLZ,
+    OP_I64_CONST,
+    OP_I64_CTZ,
+    OP_I64_DIV_S,
+    OP_I64_DIV_U,
+    OP_I64_EQ,
+    OP_I64_EQZ,
+    OP_I64_EXTEND_I32_S,
+    OP_I64_EXTEND_I32_U,
+    OP_I64_GE_S,
+    OP_I64_GE_U,
+    OP_I64_GT_S,
+    OP_I64_GT_U,
+    OP_I64_LE_S,
+    OP_I64_LE_U,
+    OP_I64_LOAD,
+    OP_I64_LOAD8_S,
+    OP_I64_LOAD8_U,
+    OP_I64_LOAD16_S,
+    OP_I64_LOAD16_U,
+    OP_I64_LOAD32_S,
+    OP_I64_LOAD32_U,
+    OP_I64_LT_S,
+    OP_I64_LT_U,
+    OP_I64_MUL,
+    OP_I64_NE,
+    OP_I64_OR,
+    OP_I64_POPCNT,
+    OP_I64_REM_S,
+    OP_I64_REM_U,
+    OP_I64_ROTL,
+    OP_I64_ROTR,
+    OP_I64_SHL,
+    OP_I64_SHR_S,
+    OP_I64_SHR_U,
+    OP_I64_STORE,
+    OP_I64_STORE8,
+    OP_I64_STORE16,
+    OP_I64_STORE32,
+    OP_I64_SUB,
+    OP_I64_XOR,
     OP_IF,
     OP_LOCAL_GET,
     OP_LOCAL_SET,
@@ -77,9 +121,13 @@ from .decoder import (
     OP_RETURN,
     OP_SELECT,
     OP_UNREACHABLE,
+    VALTYPE_I32,
+    VALTYPE_I64,
     WASM_OP_NAMES,
     FuncBody,
+    FuncType,
     WasmInstr,
+    WasmModule,
 )
 
 logger = logging.getLogger(__name__)
@@ -2177,3 +2225,250 @@ def check_basic_only(
             name = WASM_OP_NAMES.get(ins.opcode, f"0x{ins.opcode:02x}")
             bad[name] = bad.get(name, 0) + 1
     return bad
+
+
+# ===================================================================== #
+#  i64 legalization                                                       #
+# ===================================================================== #
+
+
+def legalize_i64(mod: WasmModule) -> WasmModule:
+    """Rewrite i64 values as little-endian ``(lo32, hi32)`` i32 pairs.
+
+    The transformer has a fixed four-byte value cell.  Legalizing before the
+    ordinary lowering pass keeps that machine unchanged while preserving the
+    WASM stack order and the eight-byte little-endian memory representation.
+    """
+    original_types = list(mod.types)
+    if not any(VALTYPE_I64 in ty.params + ty.results for ty in original_types) and not any(
+        any(ins.opcode >= OP_I64_EQZ and ins.opcode <= OP_I64_ROTR for ins in fn.instructions)
+        or any(ins.opcode in (OP_I32_WRAP_I64, OP_I64_EXTEND_I32_S, OP_I64_EXTEND_I32_U) for ins in fn.instructions)
+        for fn in mod.functions
+    ):
+        return mod
+
+    for imp in mod.imports:
+        if imp.kind == 0 and VALTYPE_I64 in original_types[imp.index].params + original_types[imp.index].results:
+            raise ValueError("i64 imports are unsupported; use an internal direct call")
+    if any(g["valtype"] == VALTYPE_I64 for g in mod.globals):
+        raise ValueError("i64 globals are unsupported")
+
+    def flatten(types):
+        return [VALTYPE_I32 for ty in types for _ in range(2 if ty == VALTYPE_I64 else 1)]
+
+    mod.types = [FuncType(flatten(ty.params), flatten(ty.results)) for ty in original_types]
+    memory_bytes = mod.memory_bytes or DEFAULT_MEMORY_BYTES
+    i64_memory = {
+        OP_I64_LOAD: (OP_I32_LOAD, 8), OP_I64_STORE: (OP_I32_STORE, 8),
+        OP_I64_LOAD8_S: (OP_I32_LOAD8_S, 1), OP_I64_LOAD8_U: (OP_I32_LOAD8_U, 1),
+        OP_I64_LOAD16_S: (OP_I32_LOAD16_S, 2), OP_I64_LOAD16_U: (OP_I32_LOAD16_U, 2),
+        OP_I64_LOAD32_S: (OP_I32_LOAD, 4), OP_I64_LOAD32_U: (OP_I32_LOAD, 4),
+        OP_I64_STORE8: (OP_I32_STORE8, 1), OP_I64_STORE16: (OP_I32_STORE16, 2),
+        OP_I64_STORE32: (OP_I32_STORE, 4),
+    }
+
+    for fi, func in enumerate(mod.functions):
+        logical_types = original_types[mod.func_type_indices[fi]].params + [
+            ty for count, ty in func.locals for _ in range(count)
+        ]
+        if any(ty not in (VALTYPE_I32, VALTYPE_I64) for ty in logical_types):
+            raise ValueError(f"Function {fi} has unsupported non-integer locals")
+        local_map = []
+        physical = 0
+        for ty in logical_types:
+            local_map.append((physical, ty == VALTYPE_I64))
+            physical += 2 if ty == VALTYPE_I64 else 1
+        # These are consumed only by pair rewrites; ordinary lowering adds its own locals later.
+        temps = tuple(range(physical, physical + 8))
+        a_lo, a_hi, b_lo, b_hi, result_lo, result_hi, count, address = temps
+
+        def get_pair(base):
+            return [_instr(OP_LOCAL_GET, base), _instr(OP_LOCAL_GET, base + 1)]
+
+        def set_pair(base):
+            return [_instr(OP_LOCAL_SET, base + 1), _instr(OP_LOCAL_SET, base)]
+
+        def save_binary(a_lo=a_lo, a_hi=a_hi, b_lo=b_lo, b_hi=b_hi):
+            return [_instr(OP_LOCAL_SET, b_hi), _instr(OP_LOCAL_SET, b_lo), _instr(OP_LOCAL_SET, a_hi), _instr(OP_LOCAL_SET, a_lo)]
+
+        def compare(op, a_lo=a_lo, a_hi=a_hi, b_lo=b_lo, b_hi=b_hi):
+            relation = {
+                OP_I64_LT_S: (OP_I32_LT_S, OP_I32_LT_U), OP_I64_LT_U: (OP_I32_LT_U, OP_I32_LT_U),
+                OP_I64_GT_S: (OP_I32_GT_S, OP_I32_GT_U), OP_I64_GT_U: (OP_I32_GT_U, OP_I32_GT_U),
+                OP_I64_LE_S: (OP_I32_LE_S, OP_I32_LE_U), OP_I64_LE_U: (OP_I32_LE_U, OP_I32_LE_U),
+                OP_I64_GE_S: (OP_I32_GE_S, OP_I32_GE_U), OP_I64_GE_U: (OP_I32_GE_U, OP_I32_GE_U),
+            }[op]
+            strict_hi, low_relation = relation
+            strict_hi = {
+                OP_I32_LE_S: OP_I32_LT_S,
+                OP_I32_LE_U: OP_I32_LT_U,
+                OP_I32_GE_S: OP_I32_GT_S,
+                OP_I32_GE_U: OP_I32_GT_U,
+            }.get(strict_hi, strict_hi)
+            # hi relation decides unless equal; equality uses unsigned low-word ordering.
+            return save_binary() + [
+                _instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, b_hi), _instr(strict_hi),
+                _instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, b_hi), _instr(OP_I32_EQ),
+                _instr(OP_LOCAL_GET, a_lo), _instr(OP_LOCAL_GET, b_lo), _instr(low_relation),
+                _instr(OP_I32_AND), _instr(OP_I32_OR),
+            ]
+
+        def shift_or_rotate(
+            op,
+            a_lo=a_lo,
+            a_hi=a_hi,
+            b_lo=b_lo,
+            result_lo=result_lo,
+            result_hi=result_hi,
+            count=count,
+        ):
+            """Lower a variable i64 shift/rotate one bit at a time.
+
+            This is deliberately expressed with i32 primitives so the normal
+            lowerer can choose native or base-profile implementations later.
+            """
+            out = save_binary() + [
+                _instr(OP_LOCAL_GET, b_lo), _instr(OP_I32_CONST, 63), _instr(OP_I32_AND),
+                _instr(OP_LOCAL_SET, count), _instr(OP_BLOCK, 0x40), _instr(OP_LOOP, 0x40),
+                _instr(OP_LOCAL_GET, count), _instr(OP_I32_EQZ), _instr(OP_BR_IF, 1),
+            ]
+            if op in (OP_I64_SHL, OP_I64_ROTL):
+                out += [
+                    _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_CONST, 31), _instr(OP_I32_SHR_U),
+                    _instr(OP_LOCAL_SET, result_hi),
+                    _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_CONST, 31), _instr(OP_I32_SHR_U),
+                    _instr(OP_LOCAL_SET, result_lo),
+                ]
+                out += [
+                    _instr(OP_LOCAL_GET, a_lo), _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_ADD),
+                ]
+                if op == OP_I64_ROTL:
+                    out += [_instr(OP_LOCAL_GET, result_hi), _instr(OP_I32_ADD)]
+                out += [
+                    _instr(OP_LOCAL_SET, a_lo),
+                    _instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_ADD),
+                    _instr(OP_LOCAL_GET, result_lo), _instr(OP_I32_ADD),
+                ]
+                out += [_instr(OP_LOCAL_SET, a_hi)]
+            else:
+                signed = op == OP_I64_SHR_S
+                out += [
+                    _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_CONST, 1), _instr(OP_I32_AND),
+                    _instr(OP_LOCAL_SET, result_hi),
+                ]
+                if op == OP_I64_ROTR:
+                    out += [
+                        _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_CONST, 1), _instr(OP_I32_AND),
+                        _instr(OP_LOCAL_SET, result_lo),
+                    ]
+                out += [
+                    _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_CONST, 1), _instr(OP_I32_SHR_U),
+                    _instr(OP_LOCAL_SET, a_lo),
+                    _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_CONST, 1),
+                    _instr(OP_I32_SHR_S if signed else OP_I32_SHR_U), _instr(OP_LOCAL_SET, a_hi),
+                    _instr(OP_LOCAL_GET, result_hi), _instr(OP_IF, 0x40),
+                    _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_CONST, -2147483648), _instr(OP_I32_ADD),
+                    _instr(OP_LOCAL_SET, a_lo), _instr(OP_END),
+                ]
+                if op == OP_I64_ROTR:
+                    out += [
+                        _instr(OP_LOCAL_GET, result_lo), _instr(OP_IF, 0x40),
+                        _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_CONST, -2147483648), _instr(OP_I32_ADD),
+                        _instr(OP_LOCAL_SET, a_hi), _instr(OP_END),
+                    ]
+            return out + [
+                _instr(OP_LOCAL_GET, count), _instr(OP_I32_CONST, 1), _instr(OP_I32_SUB),
+                _instr(OP_LOCAL_SET, count), _instr(OP_BR, 0), _instr(OP_END), _instr(OP_END),
+                *get_pair(a_lo),
+            ]
+
+        out = []
+        for ins in func.instructions:
+            op = ins.opcode
+            if op in (OP_BLOCK, OP_LOOP, OP_IF) and ins.immediates and ins.immediates[0] == VALTYPE_I64:
+                raise ValueError("i64 block results are unsupported")
+            if op == OP_I64_CONST:
+                value = ins.immediates[0] & ((1 << 64) - 1)
+                out.extend([_instr(OP_I32_CONST, value & 0xFFFFFFFF), _instr(OP_I32_CONST, value >> 32)])
+            elif op in (OP_LOCAL_GET, OP_LOCAL_SET, OP_LOCAL_TEE):
+                base, is_i64 = local_map[ins.immediates[0]]
+                if not is_i64:
+                    out.append(_instr(op, base))
+                elif op == OP_LOCAL_GET:
+                    out.extend(get_pair(base))
+                elif op == OP_LOCAL_SET:
+                    out.extend(set_pair(base))
+                else:
+                    # Store the pair and restore it in its original stack order.
+                    out.extend([
+                        _instr(OP_LOCAL_SET, result_hi), _instr(OP_LOCAL_SET, result_lo),
+                        _instr(OP_LOCAL_GET, result_lo), _instr(OP_LOCAL_SET, base),
+                        _instr(OP_LOCAL_GET, result_hi), _instr(OP_LOCAL_SET, base + 1),
+                        *get_pair(base),
+                    ])
+            elif op == OP_I32_WRAP_I64:
+                out.extend([_instr(OP_LOCAL_SET, result_hi)])
+            elif op in (OP_I64_EXTEND_I32_S, OP_I64_EXTEND_I32_U):
+                out.extend([_instr(OP_LOCAL_TEE, result_lo)])
+                if op == OP_I64_EXTEND_I32_S:
+                    out.extend([_instr(OP_LOCAL_GET, result_lo), _instr(OP_I32_CONST, 31), _instr(OP_I32_SHR_S)])
+                else:
+                    out.extend([_instr(OP_I32_CONST, 0)])
+            elif op in (OP_I64_ADD, OP_I64_SUB):
+                out.extend(save_binary())
+                # Preserve the low operands for carry/borrow before calculating the result.
+                out.extend([_instr(OP_LOCAL_GET, a_lo), _instr(OP_LOCAL_GET, b_lo), _instr(OP_I32_ADD if op == OP_I64_ADD else OP_I32_SUB), _instr(OP_LOCAL_TEE, result_lo)])
+                out.extend([_instr(OP_LOCAL_GET, result_lo), _instr(OP_LOCAL_GET, a_lo), _instr(OP_I32_LT_U if op == OP_I64_ADD else OP_I32_GT_U), _instr(OP_LOCAL_SET, count)])
+                out.extend([_instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, b_hi), _instr(OP_I32_ADD if op == OP_I64_ADD else OP_I32_SUB), _instr(OP_LOCAL_GET, count), _instr(OP_I32_ADD if op == OP_I64_ADD else OP_I32_SUB), _instr(OP_LOCAL_SET, result_hi)])
+                out.extend(get_pair(result_lo))
+            elif op in (OP_I64_AND, OP_I64_OR, OP_I64_XOR):
+                i32op = {OP_I64_AND: OP_I32_AND, OP_I64_OR: OP_I32_OR, OP_I64_XOR: OP_I32_XOR}[op]
+                out.extend(save_binary() + [_instr(OP_LOCAL_GET, a_lo), _instr(OP_LOCAL_GET, b_lo), _instr(i32op), _instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, b_hi), _instr(i32op)])
+            elif op == OP_I64_EQZ:
+                out.extend([_instr(OP_LOCAL_SET, a_hi), _instr(OP_I32_EQZ), _instr(OP_LOCAL_GET, a_hi), _instr(OP_I32_EQZ), _instr(OP_I32_AND)])
+            elif op in (OP_I64_EQ, OP_I64_NE):
+                out.extend(save_binary() + [_instr(OP_LOCAL_GET, a_lo), _instr(OP_LOCAL_GET, b_lo), _instr(OP_I32_EQ), _instr(OP_LOCAL_GET, a_hi), _instr(OP_LOCAL_GET, b_hi), _instr(OP_I32_EQ), _instr(OP_I32_AND)])
+                if op == OP_I64_NE:
+                    out.extend([_instr(OP_I32_EQZ)])
+            elif op in (OP_I64_LT_S, OP_I64_LT_U, OP_I64_GT_S, OP_I64_GT_U, OP_I64_LE_S, OP_I64_LE_U, OP_I64_GE_S, OP_I64_GE_U):
+                out.extend(compare(op))
+            elif op in (OP_I64_SHL, OP_I64_SHR_S, OP_I64_SHR_U, OP_I64_ROTL, OP_I64_ROTR):
+                out.extend(shift_or_rotate(op))
+            elif op in i64_memory:
+                i32op, width = i64_memory[op]
+                offset = ins.immediates[1]
+                if op == OP_I64_LOAD:
+                    out.extend([
+                        _instr(OP_LOCAL_TEE, address), _instr(OP_I32_CONST, offset), _instr(OP_I32_ADD),
+                        _instr(OP_I32_CONST, memory_bytes - width), _instr(OP_I32_LE_U), _instr(OP_I32_EQZ),
+                        _instr(OP_IF, 0x40), _instr(OP_UNREACHABLE), _instr(OP_END),
+                        _instr(OP_LOCAL_GET, address), _instr(i32op, ins.immediates[0], offset),
+                        _instr(OP_LOCAL_GET, address), _instr(i32op, ins.immediates[0], offset + 4),
+                    ])
+                elif op == OP_I64_STORE:
+                    out.extend([
+                        _instr(OP_LOCAL_SET, result_hi), _instr(OP_LOCAL_SET, result_lo), _instr(OP_LOCAL_SET, address),
+                        # Check the original eight-byte access before either half can write.
+                        _instr(OP_LOCAL_GET, address), _instr(OP_I32_CONST, offset), _instr(OP_I32_ADD),
+                        _instr(OP_I32_CONST, memory_bytes - width), _instr(OP_I32_LE_U), _instr(OP_I32_EQZ),
+                        _instr(OP_IF, 0x40), _instr(OP_UNREACHABLE), _instr(OP_END),
+                        _instr(OP_LOCAL_GET, address), _instr(OP_LOCAL_GET, result_lo), _instr(i32op, ins.immediates[0], offset),
+                        _instr(OP_LOCAL_GET, address), _instr(OP_LOCAL_GET, result_hi), _instr(i32op, ins.immediates[0], offset + 4),
+                    ])
+                elif op in (OP_I64_LOAD8_S, OP_I64_LOAD8_U, OP_I64_LOAD16_S, OP_I64_LOAD16_U, OP_I64_LOAD32_S, OP_I64_LOAD32_U):
+                    out.extend([_instr(i32op, ins.immediates[0], offset), _instr(OP_LOCAL_TEE, result_lo)])
+                    if op in (OP_I64_LOAD8_S, OP_I64_LOAD16_S, OP_I64_LOAD32_S):
+                        out.extend([_instr(OP_LOCAL_GET, result_lo), _instr(OP_I32_CONST, 31), _instr(OP_I32_SHR_S)])
+                    else:
+                        out.extend([_instr(OP_I32_CONST, 0)])
+                else:
+                    out.extend([_instr(OP_LOCAL_SET, result_lo), _instr(i32op, ins.immediates[0], offset)])
+            elif op in (OP_I64_MUL, OP_I64_DIV_S, OP_I64_DIV_U, OP_I64_REM_S, OP_I64_REM_U, OP_I64_CLZ, OP_I64_CTZ, OP_I64_POPCNT):
+                name = WASM_OP_NAMES[op]
+                raise ValueError(f"{name} is not yet supported by i64 legalization")
+            else:
+                out.append(ins)
+        param_count = len(flatten(original_types[mod.func_type_indices[fi]].params))
+        local_count = physical - param_count + len(temps)
+        mod.functions[fi] = FuncBody([(local_count, VALTYPE_I32)] if local_count else [], local_count, out)
+    return mod

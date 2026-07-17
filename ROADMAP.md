@@ -206,11 +206,15 @@ Depends on: `CRYPTO-001`, `CRYPTO-005`
 
 ### WASM-002: Add i64 support
 
-- [ ] Define the byte-level i64 stack and memory representation.
-- [ ] Implement i64 arithmetic, comparisons, shifts, and rotates.
-- [ ] Add conversion operations between i32 and i64.
-- [ ] Add differential tests against an independent WASM engine.
+- [x] Define the byte-level i64 stack and memory representation.
+- [ ] Implement remaining i64 arithmetic; comparisons, shifts, and rotates are supported.
+- [x] Add conversion operations between i32 and i64.
+- [x] Add differential tests against an independent WASM engine.
 - [ ] Re-evaluate SHA-512 and public-key cryptography after completion.
+
+Implementation note: i64 is legalized into `(low32, high32)` stack/local pairs
+before i32 lowering; memory remains eight little-endian bytes. This preserves the
+four-byte transformer value cell while supporting the initial i64 subset.
 
 ### WASM-003: Expand runtime support
 

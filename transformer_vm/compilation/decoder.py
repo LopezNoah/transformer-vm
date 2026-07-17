@@ -184,6 +184,42 @@ OP_I32_SHR_U = 0x76
 OP_I32_ROTL = 0x77
 OP_I32_ROTR = 0x78
 
+# i64 comparisons and arithmetic
+OP_I64_EQZ = 0x50
+OP_I64_EQ = 0x51
+OP_I64_NE = 0x52
+OP_I64_LT_S = 0x53
+OP_I64_LT_U = 0x54
+OP_I64_GT_S = 0x55
+OP_I64_GT_U = 0x56
+OP_I64_LE_S = 0x57
+OP_I64_LE_U = 0x58
+OP_I64_GE_S = 0x59
+OP_I64_GE_U = 0x5A
+OP_I64_CLZ = 0x79
+OP_I64_CTZ = 0x7A
+OP_I64_POPCNT = 0x7B
+OP_I64_ADD = 0x7C
+OP_I64_SUB = 0x7D
+OP_I64_MUL = 0x7E
+OP_I64_DIV_S = 0x7F
+OP_I64_DIV_U = 0x80
+OP_I64_REM_S = 0x81
+OP_I64_REM_U = 0x82
+OP_I64_AND = 0x83
+OP_I64_OR = 0x84
+OP_I64_XOR = 0x85
+OP_I64_SHL = 0x86
+OP_I64_SHR_S = 0x87
+OP_I64_SHR_U = 0x88
+OP_I64_ROTL = 0x89
+OP_I64_ROTR = 0x8A
+
+# Integer conversions
+OP_I32_WRAP_I64 = 0xA7
+OP_I64_EXTEND_I32_S = 0xAC
+OP_I64_EXTEND_I32_U = 0xAD
+
 # Sign-extension (post-MVP but very common)
 OP_I32_EXTEND8_S = 0xC0
 OP_I32_EXTEND16_S = 0xC1
@@ -253,6 +289,20 @@ WASM_OP_NAMES: dict[int, str] = {
     OP_I32_SHR_U: "i32.shr_u",
     OP_I32_ROTL: "i32.rotl",
     OP_I32_ROTR: "i32.rotr",
+    OP_I64_EQZ: "i64.eqz", OP_I64_EQ: "i64.eq", OP_I64_NE: "i64.ne",
+    OP_I64_LT_S: "i64.lt_s", OP_I64_LT_U: "i64.lt_u",
+    OP_I64_GT_S: "i64.gt_s", OP_I64_GT_U: "i64.gt_u",
+    OP_I64_LE_S: "i64.le_s", OP_I64_LE_U: "i64.le_u",
+    OP_I64_GE_S: "i64.ge_s", OP_I64_GE_U: "i64.ge_u",
+    OP_I64_CLZ: "i64.clz", OP_I64_CTZ: "i64.ctz", OP_I64_POPCNT: "i64.popcnt",
+    OP_I64_ADD: "i64.add", OP_I64_SUB: "i64.sub", OP_I64_MUL: "i64.mul",
+    OP_I64_DIV_S: "i64.div_s", OP_I64_DIV_U: "i64.div_u",
+    OP_I64_REM_S: "i64.rem_s", OP_I64_REM_U: "i64.rem_u",
+    OP_I64_AND: "i64.and", OP_I64_OR: "i64.or", OP_I64_XOR: "i64.xor",
+    OP_I64_SHL: "i64.shl", OP_I64_SHR_S: "i64.shr_s", OP_I64_SHR_U: "i64.shr_u",
+    OP_I64_ROTL: "i64.rotl", OP_I64_ROTR: "i64.rotr",
+    OP_I32_WRAP_I64: "i32.wrap_i64",
+    OP_I64_EXTEND_I32_S: "i64.extend_i32_s", OP_I64_EXTEND_I32_U: "i64.extend_i32_u",
     # Sign-extension
     OP_I32_EXTEND8_S: "i32.extend8_s",
     OP_I32_EXTEND16_S: "i32.extend16_s",
@@ -578,6 +628,12 @@ def _decode_instruction(data: bytes, pos: int) -> tuple[WasmInstr, int]:
         OP_I32_ROTR,
         OP_I32_EXTEND8_S,
         OP_I32_EXTEND16_S,
+        OP_I64_EQZ, OP_I64_EQ, OP_I64_NE, OP_I64_LT_S, OP_I64_LT_U,
+        OP_I64_GT_S, OP_I64_GT_U, OP_I64_LE_S, OP_I64_LE_U, OP_I64_GE_S, OP_I64_GE_U,
+        OP_I64_CLZ, OP_I64_CTZ, OP_I64_POPCNT, OP_I64_ADD, OP_I64_SUB, OP_I64_MUL,
+        OP_I64_DIV_S, OP_I64_DIV_U, OP_I64_REM_S, OP_I64_REM_U, OP_I64_AND, OP_I64_OR,
+        OP_I64_XOR, OP_I64_SHL, OP_I64_SHR_S, OP_I64_SHR_U, OP_I64_ROTL, OP_I64_ROTR,
+        OP_I32_WRAP_I64, OP_I64_EXTEND_I32_S, OP_I64_EXTEND_I32_U,
     ):
         return WasmInstr(opcode), pos
 

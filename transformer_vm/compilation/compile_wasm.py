@@ -72,7 +72,7 @@ from .decoder import (
     WasmModule,
     decode,
 )
-from .lower import check_basic_only, lower_hard_ops
+from .lower import check_basic_only, legalize_i64, lower_hard_ops
 
 logger = logging.getLogger(__name__)
 
@@ -587,6 +587,8 @@ def compile_wasm_to_prefix(wasm_path: str, profile: str = "auto") -> tuple[str, 
 
     with open(wasm_path, "rb") as f:
         mod = decode(f.read())
+
+    legalize_i64(mod)
 
     for fi, func in enumerate(mod.functions):
         type_idx = mod.func_type_indices[fi]
