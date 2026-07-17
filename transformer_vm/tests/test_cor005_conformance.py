@@ -184,6 +184,60 @@ def test_pytorch_standard_attention_matches_hull(universal_model):
     assert standard_tokens == hull_tokens == reference_tokens
 
 
+def _attention_trace(cache_class, trace, latest_heads=()):
+    cache = cache_class(1, 2)
+    for head in latest_heads:
+        cache.set_tiebreak(0, head, True)
+    outputs = []
+    for keys, queries, values in trace:
+        outputs.append(cache.layer_step(0, keys, queries, values))
+    return outputs
+
+
+@pytest.mark.parametrize("latest_heads", [(), (0,), (1,), (0, 1)])
+def test_attention_caches_match_tie_and_large_position_trace(latest_heads):
+    # The first head has an exact tie; the second models large position features.
+    trace = []
+    for offset in range(64):
+        pos = 1_000_000 + offset
+        trace.append(
+            (
+                torch.tensor([7.0, float(pos), float(pos), float(pos * pos)]),
+                torch.tensor([1.0, 0.0, -2.0 * pos - 1.0, 1.0]),
+                torch.tensor([float(pos), -float(pos), float(pos), float(pos + 1000)]),
+            )
+        )
+
+    standard = _attention_trace(StandardKVCache, trace, latest_heads)
+    hull = _attention_trace(HullKVCache, trace, latest_heads)
+    for expected, actual in zip(standard, hull, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+def test_attention_caches_match_adversarial_generated_traces():
+    generator = torch.Generator().manual_seed(20260716)
+    trace = []
+    for pos in range(128):
+        keys = torch.randint(-1000, 1001, (4,), generator=generator, dtype=torch.int64).double()
+        values = torch.randn(4, generator=generator)
+        queries = torch.randint(-1000, 1001, (4,), generator=generator, dtype=torch.int64).double()
+        # Alternate exact ties, zero axes, and near-cancelling large products.
+        if pos % 4 == 0:
+            keys[:2] = torch.tensor([42.0, float(pos)])
+            queries[:2] = torch.tensor([1.0, 0.0])
+        elif pos % 4 == 1:
+            keys[:2] = torch.tensor([1e12 + pos, -1e12])
+            queries[:2] = torch.tensor([1e10, 1e10])
+        elif pos % 4 == 2:
+            queries[:2] = torch.tensor([0.0, -1.0])
+        trace.append((keys, queries, values.double()))
+
+    standard = _attention_trace(StandardKVCache, trace, latest_heads=(0,))
+    hull = _attention_trace(HullKVCache, trace, latest_heads=(0,))
+    for expected, actual in zip(standard, hull, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-14, atol=1e-14)
+
+
 def test_python_hull_inference_matches_cpp(universal_model, tmp_path):
     model, all_tokens, tok_to_idx_map = universal_model
     program_path = os.path.join(DATA_DIR, "hello.txt")

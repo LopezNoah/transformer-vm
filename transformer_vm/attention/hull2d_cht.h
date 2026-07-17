@@ -23,17 +23,34 @@
  *       this file : dynamic CHT => amortized O(log h) with no bulk memmove.
  *
  * Tie-breaking:
- *   Same semantics as hull2d.h: return mean of tied values (TieBreak::LATEST is
- *   accepted but behaves like AVERAGE).
+ *   Every lookup considers every key whose dot-product score is maximal. The
+ *   default policy returns the mean of those values; TieBreak::LATEST returns
+ *   the value with the greatest insertion sequence among them. Scores are
+ *   compared in long double, never by exact double equality.
  */
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <limits>
 #include <set>
 #include <vector>
 
 enum class TieBreak { AVERAGE, LATEST };
+
+// The model's keys and queries are double, but a score combines two products.
+// Evaluate comparisons in long double so cancellation and large positions do
+// not turn mathematically distinct scores into accidental double ties.
+static inline int compare_dot(double qx, double qy, double ax, double ay,
+                              double bx, double by) {
+    long double a = (long double)qx * ax + (long double)qy * ay;
+    long double b = (long double)qx * bx + (long double)qy * by;
+    return (a > b) - (a < b);
+}
+
+static inline bool same_coordinate(double a, double b) {
+    return !(a < b) && !(b < a);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  HullMeta — aggregate value metadata (sum + count for averaging)
@@ -129,7 +146,7 @@ struct _HullCHT {
             return false;
         }
 
-        if (x->m == y->m) {
+        if (same_coordinate(x->m, y->m)) {
             // Keep the one with larger intercept for max envelope.
             x->p = (x->b >= y->b ? INF : -INF);
         } else {
@@ -148,8 +165,8 @@ struct _HullCHT {
         nl.meta = meta;
 
         auto it = lines.lower_bound(nl);
-        if (it != lines.end() && it->m == m) {
-            if (it->b == b) {
+        if (it != lines.end() && same_coordinate(it->m, m)) {
+            if (same_coordinate(it->b, b)) {
                 // Same line: merge meta.
                 Line merged = *it;
                 merged.meta.merge(meta);
@@ -164,8 +181,8 @@ struct _HullCHT {
             }
         } else if (it != lines.begin()) {
             auto it2 = std::prev(it);
-            if (it2->m == m) {
-                if (it2->b == b) {
+            if (same_coordinate(it2->m, m)) {
+                if (same_coordinate(it2->b, b)) {
                     Line merged = *it2;
                     merged.meta.merge(meta);
                     lines.erase(it2);
@@ -253,7 +270,7 @@ struct HullHalf {
                double* score_out = nullptr, double* best_kx_out = nullptr) const {
         if (cht.empty()) return false;
 
-        if (qy == 0.0) {
+        if (std::fpclassify(qy) == FP_ZERO) {
             long double x = (qx >= 0 ? _HullCHT::INF : -_HullCHT::INF);
             auto it = cht.argmax(x);
             it->meta.resolve(tb, out);
@@ -281,8 +298,7 @@ struct HullHalf {
             auto prev = std::prev(itL);
             double kx_p = is_upper ? prev->m : -prev->m;
             double ky_p = is_upper ? prev->b : -prev->b;
-            double s = qx * kx_p + qy * ky_p;
-            if (s == best_score) {
+            if (compare_dot(qx, qy, kx_p, ky_p, kx_best, ky_best) == 0) {
                 combined.merge(prev->meta);
                 itL = prev;
             } else {
@@ -294,8 +310,7 @@ struct HullHalf {
         while (itR != cht.lines.end()) {
             double kx_p = is_upper ? itR->m : -itR->m;
             double ky_p = is_upper ? itR->b : -itR->b;
-            double s = qx * kx_p + qy * ky_p;
-            if (s == best_score) {
+            if (compare_dot(qx, qy, kx_p, ky_p, kx_best, ky_best) == 0) {
                 combined.merge(itR->meta);
                 ++itR;
             } else {
@@ -344,13 +359,13 @@ struct HardAttentionHead {
             min_kx = key[0];
             left_meta = {};
         }
-        if (key[0] == min_kx) left_meta.add(val, seq);
+        if (same_coordinate(key[0], min_kx)) left_meta.add(val, seq);
 
         if (key[0] > max_kx) {
             max_kx = key[0];
             right_meta = {};
         }
-        if (key[0] == max_kx) right_meta.add(val, seq);
+        if (same_coordinate(key[0], max_kx)) right_meta.add(val, seq);
 
         upper.insert(key[0], key[1], val, seq);
         lower.insert(key[0], key[1], val, seq);
@@ -359,7 +374,7 @@ struct HardAttentionHead {
 
     bool query(const double q[2], TieBreak tb, double out[2]) const {
         double qx = q[0], qy = q[1];
-        if (qy == 0.0) {
+        if (std::fpclassify(qy) == FP_ZERO) {
             if (qx > 0.0)      right_meta.resolve(tb, out);
             else if (qx < 0.0) left_meta.resolve(tb, out);
             else                global.resolve(tb, out);
@@ -397,17 +412,14 @@ struct BruteAttentionHead {
         if (entries.empty()) { out[0] = out[1] = 0; return false; }
 
         double qx = q[0], qy = q[1];
-        double max_score = -std::numeric_limits<double>::infinity();
-        double best_kx = 0;
+        const Entry* best = &entries.front();
         for (const auto& e : entries) {
-            double s = qx * e.kx + qy * e.ky;
-            if (s > max_score) { max_score = s; best_kx = e.kx; }
+            if (compare_dot(qx, qy, e.kx, e.ky, best->kx, best->ky) > 0) best = &e;
         }
 
         HullMeta meta;
         for (const auto& e : entries) {
-            double s = qx * e.kx + qy * e.ky;
-            if (s == max_score) {
+            if (compare_dot(qx, qy, e.kx, e.ky, best->kx, best->ky) == 0) {
                 double v[2] = {e.vx, e.vy};
                 meta.add(v, e.seq);
             }
