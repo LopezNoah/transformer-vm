@@ -236,10 +236,10 @@ Relevant code: `transformer_vm/attention/`, `transformer_vm/graph/core.py`
 
 ### PERF-001: Expand sparse execution
 
-- [ ] Measure sparsity for every projection and layer.
-- [ ] Define a versioned sparse tensor serialization format.
-- [ ] Load and execute sparse projections in Python and C++.
-- [ ] Skip inactive heads and layers where correctness permits.
+- [x] Measure sparsity for every projection and layer.
+- [x] Define a versioned sparse tensor serialization format.
+- [x] Load and execute sparse projections in Python and C++.
+- [x] Skip inactive heads and layers where correctness permits.
 - [ ] Benchmark against current dense execution on macOS and Linux.
 
 ### PERF-002: Fuse inference operations

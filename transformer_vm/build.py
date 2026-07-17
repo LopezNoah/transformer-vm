@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def build(plan_path=None, max_layers=None, no_reuse=False, max_ffn=None):
+def build(plan_path=None, max_layers=None, no_reuse=False, max_ffn=None, profile="full"):
     """Build the universal WASM transformer.
 
     Returns (model, all_tokens, tok_to_idx_map).
@@ -21,7 +21,11 @@ def build(plan_path=None, max_layers=None, no_reuse=False, max_ffn=None):
     from transformer_vm.model.weights import build_model
 
     model, all_tokens, tok_to_idx_map, _ = build_model(
-        plan_path=plan_path, max_layers=max_layers, no_reuse=no_reuse, max_ffn=max_ffn
+        plan_path=plan_path,
+        max_layers=max_layers,
+        no_reuse=no_reuse,
+        max_ffn=max_ffn,
+        profile=profile,
     )
     return model, all_tokens, tok_to_idx_map
 
@@ -49,6 +53,7 @@ def main():
     )
     parser.add_argument("--max-ffn", type=int, default=None, help="Max FFN neurons per layer")
     parser.add_argument("--no-reuse", action="store_true", help="Disable slot reuse")
+    parser.add_argument("--profile", choices=("base", "full"), default="full")
     parser.add_argument(
         "--save-weights", type=str, default=None, help="Save weights to binary file"
     )
@@ -56,7 +61,11 @@ def main():
 
     plan = None if args.milp else args.plan
     model, all_tokens, tok_to_idx_map = build(
-        plan_path=plan, max_layers=args.max_layers, no_reuse=args.no_reuse, max_ffn=args.max_ffn
+        plan_path=plan,
+        max_layers=args.max_layers,
+        no_reuse=args.no_reuse,
+        max_ffn=args.max_ffn,
+        profile=args.profile,
     )
 
     d_model = model.tok.weight.shape[1]
@@ -65,7 +74,7 @@ def main():
     n_heads = model.attn[0].num_heads
     n_params = sum(p.numel() for p in model.parameters())
 
-    logger.info("Universal model:")
+    logger.info("Universal %s model:", args.profile)
     logger.info(
         "  d_model=%d, n_layers=%d, n_heads=%d, d_ffn=%d", d_model, n_layers, n_heads, d_ffn
     )

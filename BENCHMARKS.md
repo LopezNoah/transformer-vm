@@ -97,3 +97,25 @@ WASM-ops/s). Its time breakdown was:
 These are single-run observations. Hardware, operating-system version, and
 power state were not captured, so the throughput values should not be treated
 as cross-machine comparisons.
+
+## PERF-001 Sparse Execution
+
+`wasm-build --save-weights=model.bin` now emits versioned CSR projections for
+the embedding, every attention and FFN projection, and the output head. The
+C++ runtime also accepts the prior dense artifacts. Rebuild the model and run
+the same workload with the C++ runner to compare sparse execution on a target
+machine; record operating system, CPU, BLAS configuration, and power state.
+
+The C++ engine accepts `--dense` to materialize the same CSR artifact and run
+the original dense projection loops. This isolates projection representation
+while retaining the same model, cache, program, and reference comparison.
+
+| Workload | Projection mode | Tokens | Time | Throughput | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| collatz | dense | 44,332 | 72.36 s | 613 tok/s | PASS |
+| collatz | sparse | 44,332 | 1.93 s | 22,954 tok/s | PASS |
+
+These single macOS runs used the full `model.bin`, Accelerate, and identical
+Collatz input. Sparse projection execution was 37.4x faster. Repeat with
+`wasm-run --dense transformer_vm/data/collatz.txt` and without `--dense` on
+each target machine before treating this as a regression threshold.

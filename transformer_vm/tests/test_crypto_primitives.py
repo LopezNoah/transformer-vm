@@ -14,6 +14,7 @@ from transformer_vm.compilation.compile_wasm import (
 from transformer_vm.compilation.decoder import (
     OP_END,
     OP_I32_AND,
+    OP_I32_MUL,
     OP_I32_OR,
     OP_I32_ROTL,
     OP_I32_ROTR,
@@ -89,8 +90,9 @@ def test_native_crypto_ops_are_exact_32_bit(name, opcode, left, right):
 @pytest.fixture(scope="module")
 def crypto_graph_runtime():
     from transformer_vm.evaluator import Runtime
+    from transformer_vm.wasm.interpreter import WASMMachine
 
-    runtime = Runtime(use_hull=False)
+    runtime = Runtime(use_hull=False, program_graph=WASMMachine(profile="full").build())
     yield runtime
     runtime.destroy()
 
@@ -146,6 +148,27 @@ def test_lowering_preserves_native_crypto_ops_by_default():
         OP_END,
     ]
     assert len(lowered.instructions) > len(native.instructions)
+
+
+def test_lowering_preserves_native_crypto_when_other_ops_are_lowered():
+    body = FuncBody(
+        locals=[],
+        num_locals=0,
+        instructions=[
+            WasmInstr(OP_LOCAL_GET, (0,)),
+            WasmInstr(OP_LOCAL_GET, (1,)),
+            WasmInstr(OP_I32_XOR),
+            WasmInstr(OP_LOCAL_GET, (0,)),
+            WasmInstr(OP_I32_MUL),
+            WasmInstr(OP_END),
+        ],
+    )
+
+    lowered = lower_hard_ops(body, num_params=2)
+    opcodes = [instruction.opcode for instruction in lowered.instructions]
+
+    assert OP_I32_XOR in opcodes
+    assert OP_I32_MUL not in opcodes
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="requires the Node WebAssembly runtime")

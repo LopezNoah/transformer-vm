@@ -95,7 +95,7 @@ def _build_cpp_engine():
     """Build the C++ inference engine if not already built."""
     binary = os.path.abspath(_CPP_BINARY)
     source = os.path.abspath(_CPP_SOURCE)
-    if os.path.exists(binary):
+    if os.path.exists(binary) and os.path.getmtime(binary) >= os.path.getmtime(source):
         return binary
     if not os.path.exists(source):
         return None
@@ -126,7 +126,7 @@ def _build_cpp_engine():
         return None
 
 
-def run_cpp_engine(binary, model_path, files, brute=False):
+def run_cpp_engine(binary, model_path, files, brute=False, dense=False):
     """Run programs through the C++ inference engine.
 
     Returns True if all programs with refs passed.
@@ -134,6 +134,8 @@ def run_cpp_engine(binary, model_path, files, brute=False):
     cmd = [binary, model_path]
     if brute:
         cmd.append("--brute")
+    if dense:
+        cmd.append("--dense")
     cmd += files
     result = subprocess.run(cmd)
     return result.returncode == 0
@@ -141,10 +143,14 @@ def run_cpp_engine(binary, model_path, files, brute=False):
 
 # ── Main ──────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model.bin")
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+DEFAULT_MODELS = {
+    "base": os.path.join(_MODEL_DIR, "model-base.bin"),
+    "full": os.path.join(_MODEL_DIR, "model.bin"),
+}
 
 
-def _ensure_model(model_path):
+def _ensure_model(model_path, profile="full"):
     """Build model weights if they don't exist."""
     model_path = os.path.abspath(model_path)
     if os.path.exists(model_path):
@@ -155,10 +161,42 @@ def _ensure_model(model_path):
     from transformer_vm.build import build
     from transformer_vm.model.weights import save_weights
 
-    model, all_tokens, tok_to_idx_map = build()
+    model, all_tokens, tok_to_idx_map = build(profile=profile)
     save_weights(model, all_tokens, model_path)
+    logger.info(
+        "[model] %s: d_model=%d, layers=%d, heads=%d, parameters=%s",
+        profile,
+        model.tok.weight.shape[1],
+        len(model.attn),
+        model.attn[0].num_heads,
+        f"{sum(parameter.numel() for parameter in model.parameters()):,}",
+    )
     logger.info("[model] Saved weights to %s", model_path)
     return model_path
+
+
+def required_profile(program_file):
+    """Derive the smallest compatible profile from serialized program opcodes."""
+    from transformer_vm.wasm.interpreter import CRYPTO_OPCODES
+
+    with open(program_file) as f:
+        tokens = set(f.read().split())
+    return "full" if tokens & CRYPTO_OPCODES else "base"
+
+
+def model_profile(model_path):
+    """Derive artifact capability from its vocabulary without loading weights."""
+    from transformer_vm.model.weights import load_vocabulary
+    from transformer_vm.wasm.interpreter import CRYPTO_OPCODES
+
+    tokens = set(load_vocabulary(model_path))
+    return "full" if tokens >= CRYPTO_OPCODES else "base"
+
+
+def _validate_model(model_path, required):
+    available = model_profile(model_path)
+    if required == "full" and available != "full":
+        raise ValueError(f"Program requires the full profile, but {model_path} is a base model")
 
 
 def main():
@@ -168,9 +206,10 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=DEFAULT_MODEL,
-        help="Path to model weights (.bin); auto-built if missing",
+        default=None,
+        help="Use one model artifact for every program instead of profile dispatch",
     )
+    parser.add_argument("--profile", choices=("auto", "base", "full"), default="auto")
     parser.add_argument(
         "--python", action="store_true", help="Force Python inference (default uses C++ engine)"
     )
@@ -178,6 +217,11 @@ def main():
         "--nohull",
         action="store_true",
         help="Use brute-force O(n) attention (StandardKVCache) instead of hull cache",
+    )
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="Materialize dense C++ projections for sparse-performance comparisons",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Print the full generated token sequence"
@@ -191,7 +235,7 @@ def main():
     logger.info("[compile] Checking for compiled programs...")
     from transformer_vm.compilation.compile_wasm import ensure_data
 
-    ensure_data()
+    ensure_data(profile=args.profile)
 
     files = args.files
     if not files:
@@ -201,8 +245,27 @@ def main():
         files = [f for f in files if not any(s in f for s in ("_ref", "_spec"))]
     logger.info("[compile] %d program(s) to run", len(files))
 
-    # Step 2: Build transformer weights if needed
-    model_path = _ensure_model(args.model)
+    selected_profiles = {}
+    for file in files:
+        actual = required_profile(file)
+        selected = actual if args.profile == "auto" else args.profile
+        if selected == "base" and actual == "full":
+            raise ValueError(f"{file} contains native crypto opcodes unsupported by the base profile")
+        selected_profiles[file] = selected
+        logger.info("[dispatch] %s -> %s", os.path.basename(file), selected)
+
+    model_paths = {}
+    if args.model:
+        build_profile = "full" if "full" in selected_profiles.values() else "base"
+        shared_path = _ensure_model(args.model, profile=build_profile)
+        for profile in set(selected_profiles.values()):
+            _validate_model(shared_path, profile)
+            model_paths[profile] = shared_path
+    else:
+        for profile in set(selected_profiles.values()):
+            path = _ensure_model(DEFAULT_MODELS[profile], profile=profile)
+            _validate_model(path, profile)
+            model_paths[profile] = path
 
     # Step 3: Build C++ inference engine and run
     if not args.python:
@@ -211,17 +274,22 @@ def main():
             raise RuntimeError(
                 "Could not build C++ inference engine. Use --python to run with Python instead."
             )
-        logger.info("[engine] Running %d program(s) via C++ engine", len(files))
-        ok = run_cpp_engine(binary, model_path, files, brute=args.nohull)
-        if not ok:
-            raise SystemExit(1)
+        for profile, model_path in model_paths.items():
+            profile_files = [file for file in files if selected_profiles[file] == profile]
+            logger.info(
+                "[engine] Running %d %s program(s) via C++ engine", len(profile_files), profile
+            )
+            if not run_cpp_engine(binary, model_path, profile_files, brute=args.nohull, dense=args.dense):
+                raise SystemExit(1)
         return
 
     # Python inference fallback
     logger.info("[engine] Running %d program(s) via Python inference", len(files))
-    from transformer_vm.model.weights import load_weights
+    from transformer_vm.model.weights import flops_per_token, load_weights
 
-    model, all_tokens, tok_to_idx_map = load_weights(model_path)
+    loaded_models = {
+        profile: load_weights(path) for profile, path in model_paths.items()
+    }
 
     if args.nohull:
         from transformer_vm.attention import StandardKVCache
@@ -235,6 +303,7 @@ def main():
     passed = failed = skipped = 0
     total_tokens = total_ops = 0
     total_time = 0.0
+    total_flops = 0
 
     for prog_file in files:
         if "_ref" in prog_file:
@@ -242,6 +311,7 @@ def main():
         name = os.path.basename(prog_file).replace(".txt", "")
         ref_file = prog_file.replace(".txt", "_ref.txt")
         has_ref = os.path.exists(ref_file)
+        model, all_tokens, tok_to_idx_map = loaded_models[selected_profiles[prog_file]]
 
         t0 = time.time()
         ok, n_tok, n_ops = run_model_program(
@@ -258,6 +328,7 @@ def main():
         total_tokens += n_tok
         total_ops += n_ops
         total_time += dt
+        total_flops += n_tok * flops_per_token(model)
 
         if has_ref:
             status = "PASS" if ok else "FAIL"
@@ -287,16 +358,13 @@ def main():
 
     logger.info("%d passed, %d failed, %d no-ref", passed, failed, skipped)
     if total_time > 0:
-        from transformer_vm.model.weights import flops_per_token
-
-        fpt = flops_per_token(model)
         logger.info("Benchmark: %d tok, %d ops, %.2fs", total_tokens, total_ops, total_time)
         logger.info(
             "  %.0f tok/s, %.0f wasm-ops/s",
             total_tokens / total_time,
             total_ops / total_time if total_ops else 0,
         )
-        logger.info("  %.1fM FLOPs/tok", fpt / 1e6)
+        logger.info("  %.1fM average FLOPs/tok", total_flops / max(total_tokens, 1) / 1e6)
     if failed:
         raise SystemExit(1)
 

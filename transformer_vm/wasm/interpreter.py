@@ -130,7 +130,31 @@ OPCODES = {
     "output": 0xFF,
     "input_base": 0xFE,
 }
+CRYPTO_OPCODE_ORDER = (
+    "i32.and",
+    "i32.or",
+    "i32.xor",
+    "i32.shl",
+    "i32.shr_s",
+    "i32.shr_u",
+    "i32.rotl",
+    "i32.rotr",
+)
+CRYPTO_OPCODES = frozenset(CRYPTO_OPCODE_ORDER)
+CAPABILITY_PROFILES = {
+    "base": frozenset(OPCODES) - CRYPTO_OPCODES,
+    "full": frozenset(OPCODES),
+}
 OPCODE_POINT = {op: points[i] for i, op in enumerate(OPCODES)}
+
+
+def normalize_profile(profile):
+    profile = "full" if profile is None else profile.lower()
+    if profile == "crypto":
+        profile = "full"
+    if profile not in CAPABILITY_PROFILES:
+        raise ValueError(f"Unknown capability profile: {profile}")
+    return profile
 
 
 def get_byte_value(bv, i, signed=False):
@@ -221,7 +245,16 @@ STS_OPS = {
 LOCAL_STRIDE = 256
 
 
-def build(program=None):
+def build(program=None, profile="full"):
+    profile = normalize_profile(profile)
+    enabled_opcodes = CAPABILITY_PROFILES[profile]
+    if program is not None:
+        unsupported = sorted({ins["opcode"] for ins in program} - enabled_opcodes)
+        if unsupported:
+            raise ValueError(
+                f"Program requires opcodes unsupported by the {profile} profile: "
+                + ", ".join(unsupported)
+            )
     one = _graph.one
     position = _graph.position
 
@@ -277,7 +310,9 @@ def build(program=None):
             + sd * delta_stack
             + sts * store_to_stack
             + bt * is_jump
-            for sd, sts in {(STACK_DELTA[op], 1 if op in STS_OPS else 0) for op in OPCODES}
+            for sd, sts in {
+                (STACK_DELTA[op], 1 if op in STS_OPS else 0) for op in enabled_opcodes
+            }
             for bt in range(2)
         }
         | {
@@ -296,6 +331,8 @@ def build(program=None):
         input_tokens["{"] = 0 * one
         input_tokens["}"] = 3 * delta_stack
         for op in OPCODES:
+            if op not in enabled_opcodes:
+                continue
             sd = STACK_DELTA[op]
             sts = 1 if op in STS_OPS else 0
             px, py = OPCODE_POINT[op]
@@ -476,97 +513,120 @@ def build(program=None):
     sub_borrow = 1 - stepglu(one, sub_value)
     sub_byte = sub_value + 256 * sub_borrow
 
-    # Native crypto arithmetic works directly on the bit embeddings carried by
-    # byte tokens, avoiding the long instruction traces produced by lowering.
-    bit_and = [reglu(second_bits[i], top_bits[i]) for i in range(8)]
-    and_byte = sum((1 << i) * bit_and[i] for i in range(8))
-    or_byte = sum((1 << i) * (second_bits[i] + top_bits[i] - bit_and[i]) for i in range(8))
-    xor_byte = sum(
-        (1 << i) * (second_bits[i] + top_bits[i] - 2 * bit_and[i]) for i in range(8)
-    )
-
-    count_bits = fetch(byte_bits[:5], query=stack_top_position, key=position)
-    count_low = count_bits[0] + 2 * count_bits[1] + 4 * count_bits[2]
-    count_high = count_bits[3] + 2 * count_bits[4]
-    count_value = count_low + 8 * count_high
-    count_selectors = []
-    for count in range(8):
-        selector = one
-        for bit in range(3):
-            expected = (count >> bit) & 1
-            selector = reglu(selector, count_bits[bit] if expected else 1 - count_bits[bit])
-        count_selectors.append(selector)
-
-    def select_shift_bits(current, neighbor, left):
-        result = []
-        for output_bit in range(8):
-            choices = []
-            for count in range(8):
-                source_bit = output_bit - count if left else output_bit + count
-                if source_bit < 0:
-                    source = neighbor[8 + source_bit]
-                elif source_bit >= 8:
-                    source = neighbor[source_bit - 8]
-                else:
-                    source = current[source_bit]
-                choices.append(reglu(source, count_selectors[count]))
-            result.append(sum(choices))
-        return result
-
-    left_byte = byte_index - count_high
-    shl_current = fetch(byte_bits, query=stack_second_position + left_byte, key=position)
-    shl_previous = fetch(byte_bits, query=stack_second_position + left_byte - 1, key=position)
-    shl_bits = select_shift_bits(shl_current, shl_previous, left=True)
-
-    right_byte = byte_index + count_high
-    shr_current = fetch(byte_bits, query=stack_second_position + right_byte, key=position)
-    shr_next = fetch(byte_bits, query=stack_second_position + right_byte + 1, key=position)
-    shr_bits = select_shift_bits(shr_current, shr_next, left=False)
-
-    rotl_wrap = stepglu(one, count_high - byte_index - 1)
-    rotl_previous_wrap = stepglu(one, count_high - byte_index)
-    rotl_current = fetch(
-        byte_bits,
-        query=stack_second_position + left_byte + 4 * rotl_wrap,
-        key=position,
-    )
-    rotl_previous = fetch(
-        byte_bits,
-        query=stack_second_position + left_byte - 1 + 4 * rotl_previous_wrap,
-        key=position,
-    )
-    rotl_bits = select_shift_bits(rotl_current, rotl_previous, left=True)
-
-    rotr_wrap = stepglu(one, right_byte - 4)
-    rotr_next_wrap = stepglu(one, right_byte - 3)
-    rotr_current = fetch(
-        byte_bits,
-        query=stack_second_position + right_byte - 4 * rotr_wrap,
-        key=position,
-    )
-    rotr_next = fetch(
-        byte_bits,
-        query=stack_second_position + right_byte + 1 - 4 * rotr_next_wrap,
-        key=position,
-    )
-    rotr_bits = select_shift_bits(rotr_current, rotr_next, left=False)
-
-    source_sign = fetch(byte_bits[7], query=stack_second_position + 3, key=position)
-    shl_value = 0
-    shr_u_value = 0
-    shr_s_value = 0
-    rotl_value = 0
-    rotr_value = 0
-    for bit in range(8):
-        shl_valid = stepglu(one, 8 * byte_index + bit - count_value)
-        shr_valid = stepglu(one, 31 - 8 * byte_index - bit - count_value)
-        shl_value += (1 << bit) * reglu(shl_bits[bit], shl_valid)
-        shr_u_value += (1 << bit) * reglu(shr_bits[bit], shr_valid)
-        shr_s_value += (1 << bit) * (
-            reglu(shr_bits[bit], shr_valid) + reglu(source_sign, 1 - shr_valid)
+    crypto_values = {}
+    bitwise_ops = CRYPTO_OPCODES & {"i32.and", "i32.or", "i32.xor"} & enabled_opcodes
+    if bitwise_ops:
+        # Native crypto arithmetic works directly on byte-token bit embeddings.
+        bit_and = [reglu(second_bits[i], top_bits[i]) for i in range(8)]
+        crypto_values["i32.and"] = sum((1 << i) * bit_and[i] for i in range(8))
+        crypto_values["i32.or"] = sum(
+            (1 << i) * (second_bits[i] + top_bits[i] - bit_and[i]) for i in range(8)
         )
-        rotl_value += (1 << bit) * rotl_bits[bit]
-        rotr_value += (1 << bit) * rotr_bits[bit]
+        crypto_values["i32.xor"] = sum(
+            (1 << i) * (second_bits[i] + top_bits[i] - 2 * bit_and[i]) for i in range(8)
+        )
+
+    shift_ops = (CRYPTO_OPCODES & enabled_opcodes) - {"i32.and", "i32.or", "i32.xor"}
+    if shift_ops:
+        count_bits = fetch(byte_bits[:5], query=stack_top_position, key=position)
+        count_low = count_bits[0] + 2 * count_bits[1] + 4 * count_bits[2]
+        count_high = count_bits[3] + 2 * count_bits[4]
+        count_value = count_low + 8 * count_high
+        count_selectors = []
+        for count in range(8):
+            selector = one
+            for bit in range(3):
+                expected = (count >> bit) & 1
+                selector = reglu(selector, count_bits[bit] if expected else 1 - count_bits[bit])
+            count_selectors.append(selector)
+
+        def select_shift_bits(current, neighbor, left):
+            result = []
+            for output_bit in range(8):
+                choices = []
+                for count in range(8):
+                    source_bit = output_bit - count if left else output_bit + count
+                    if source_bit < 0:
+                        source = neighbor[8 + source_bit]
+                    elif source_bit >= 8:
+                        source = neighbor[source_bit - 8]
+                    else:
+                        source = current[source_bit]
+                    choices.append(reglu(source, count_selectors[count]))
+                result.append(sum(choices))
+            return result
+
+        if shift_ops & {"i32.shl", "i32.rotl"}:
+            left_byte = byte_index - count_high
+        if "i32.shl" in shift_ops:
+            shl_current = fetch(byte_bits, query=stack_second_position + left_byte, key=position)
+            shl_previous = fetch(
+                byte_bits, query=stack_second_position + left_byte - 1, key=position
+            )
+            shl_bits = select_shift_bits(shl_current, shl_previous, left=True)
+            shl_value = 0
+            for bit in range(8):
+                shl_valid = stepglu(one, 8 * byte_index + bit - count_value)
+                shl_value += (1 << bit) * reglu(shl_bits[bit], shl_valid)
+            crypto_values["i32.shl"] = shl_value
+
+        if shift_ops & {"i32.shr_s", "i32.shr_u", "i32.rotr"}:
+            right_byte = byte_index + count_high
+        if shift_ops & {"i32.shr_s", "i32.shr_u"}:
+            shr_current = fetch(byte_bits, query=stack_second_position + right_byte, key=position)
+            shr_next = fetch(
+                byte_bits, query=stack_second_position + right_byte + 1, key=position
+            )
+            shr_bits = select_shift_bits(shr_current, shr_next, left=False)
+            shr_values = {
+                op: 0 for op in ("i32.shr_s", "i32.shr_u") if op in shift_ops
+            }
+            source_sign = (
+                fetch(byte_bits[7], query=stack_second_position + 3, key=position)
+                if "i32.shr_s" in shift_ops
+                else None
+            )
+            for bit in range(8):
+                shr_valid = stepglu(one, 31 - 8 * byte_index - bit - count_value)
+                if "i32.shr_u" in shr_values:
+                    shr_values["i32.shr_u"] += (1 << bit) * reglu(shr_bits[bit], shr_valid)
+                if "i32.shr_s" in shr_values:
+                    shr_values["i32.shr_s"] += (1 << bit) * (
+                        reglu(shr_bits[bit], shr_valid) + reglu(source_sign, 1 - shr_valid)
+                    )
+            crypto_values.update(shr_values)
+
+        if "i32.rotl" in shift_ops:
+            rotl_wrap = stepglu(one, count_high - byte_index - 1)
+            rotl_previous_wrap = stepglu(one, count_high - byte_index)
+            rotl_current = fetch(
+                byte_bits,
+                query=stack_second_position + left_byte + 4 * rotl_wrap,
+                key=position,
+            )
+            rotl_previous = fetch(
+                byte_bits,
+                query=stack_second_position + left_byte - 1 + 4 * rotl_previous_wrap,
+                key=position,
+            )
+            rotl_bits = select_shift_bits(rotl_current, rotl_previous, left=True)
+            crypto_values["i32.rotl"] = sum((1 << bit) * rotl_bits[bit] for bit in range(8))
+
+        if "i32.rotr" in shift_ops:
+            rotr_wrap = stepglu(one, right_byte - 4)
+            rotr_next_wrap = stepglu(one, right_byte - 3)
+            rotr_current = fetch(
+                byte_bits,
+                query=stack_second_position + right_byte - 4 * rotr_wrap,
+                key=position,
+            )
+            rotr_next = fetch(
+                byte_bits,
+                query=stack_second_position + right_byte + 1 - 4 * rotr_next_wrap,
+                key=position,
+            )
+            rotr_bits = select_shift_bits(rotr_current, rotr_next, left=False)
+            crypto_values["i32.rotr"] = sum((1 << bit) * rotr_bits[bit] for bit in range(8))
 
     # ── Comparisons ──────────────────────────────────────────────────
     a_gt_b_u = stepglu(one, stack_second_value - stack_top_value - 1)
@@ -630,18 +690,15 @@ def build(program=None):
         + reglu(second_byte, op_dot("select") - cond_nonzero)
     )
 
+    crypto_result = sum(
+        (reglu(crypto_values[op], op_dot(op)) for op in CRYPTO_OPCODE_ORDER if op in crypto_values),
+        Expression(),
+    )
     result_byte = persist(
         reglu(branch_sub_val, op_dot("i32.const"))
         + reglu(add_byte, op_dot("i32.add"))
         + reglu(sub_byte, op_dot("i32.sub"))
-        + reglu(and_byte, op_dot("i32.and"))
-        + reglu(or_byte, op_dot("i32.or"))
-        + reglu(xor_byte, op_dot("i32.xor"))
-        + reglu(shl_value, op_dot("i32.shl"))
-        + reglu(shr_s_value, op_dot("i32.shr_s"))
-        + reglu(shr_u_value, op_dot("i32.shr_u"))
-        + reglu(rotl_value, op_dot("i32.rotl"))
-        + reglu(rotr_value, op_dot("i32.rotr"))
+        + crypto_result
         + result_byte_early
         + reglu(memory_byte, op_dot("i32.load"))
         + reglu(memory_byte, op_dot("i32.load8_u") + is_boundary - 1)
@@ -727,7 +784,9 @@ def build(program=None):
         tok = f"out({chr(bv)})" if 0x20 < bv < 0x7F else f"out({bv:02x})"
         output_tokens[tok] = H * emit_out + (2 * bv) * top_byte - bv * bv
 
-    for sd, sts in {(STACK_DELTA[op], 1 if op in STS_OPS else 0) for op in OPCODES}:
+    for sd, sts in {
+        (STACK_DELTA[op], 1 if op in STS_OPS else 0) for op in enabled_opcodes
+    }:
         for bt in range(2):
             output_tokens[f"commit({sd:+d},sts={sts},bt={bt})"] = (
                 H * emit_commit
@@ -760,12 +819,13 @@ class WASMMachine:
     weights, eliminating the program prefix and instruction-fetch attention.
     """
 
-    def __init__(self, program=None):
+    def __init__(self, program=None, profile="full"):
         self.program = program
+        self.profile = normalize_profile(profile)
 
     def build(self):
         from transformer_vm.graph.core import ProgramGraph, reset_graph
 
         reset_graph()
-        input_tokens, output_tokens = build(program=self.program)
+        input_tokens, output_tokens = build(program=self.program, profile=self.profile)
         return ProgramGraph(input_tokens, output_tokens)

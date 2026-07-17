@@ -5,6 +5,7 @@ import shutil
 import pytest
 
 from transformer_vm.compilation.compile_wasm import compile_c_to_wasm, compile_wasm_to_prefix
+from transformer_vm.wasm.interpreter import CRYPTO_OPCODES
 
 
 def _wasm_with_memory_grow() -> bytes:
@@ -30,8 +31,10 @@ def test_lowering_stress_fixture_compiles_to_basic_instructions(tmp_path):
 
     wasm_path = compile_c_to_wasm(str(fixture))
     prefix, _ = compile_wasm_to_prefix(wasm_path)
+    base_prefix, _ = compile_wasm_to_prefix(wasm_path, profile="base")
 
     assert prefix.startswith("{\n")
+    assert CRYPTO_OPCODES.isdisjoint(base_prefix.split())
 
 
 def test_compiler_rejects_unsupported_instruction_after_lowering(tmp_path):

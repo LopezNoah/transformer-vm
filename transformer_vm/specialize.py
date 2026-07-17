@@ -83,7 +83,7 @@ def spec_input_from_txt(filepath):
     return ["start"] + tokens[end + 1 :]
 
 
-def specialize(filepath):
+def specialize(filepath, profile="auto"):
     """Specialize the WASM interpreter for the program in filepath.
 
     Returns (model, all_tokens, tok_to_idx_map, instructions).
@@ -91,9 +91,16 @@ def specialize(filepath):
     instructions = parse_program(filepath)
     logger.info("Parsed %d instructions from %s", len(instructions), filepath)
 
-    from transformer_vm.wasm.interpreter import WASMMachine
+    from transformer_vm.wasm.interpreter import CRYPTO_OPCODES, WASMMachine, normalize_profile
 
-    pg = WASMMachine(program=instructions).build()
+    if profile == "auto":
+        opcodes = {instruction["opcode"] for instruction in instructions}
+        profile = "full" if opcodes & CRYPTO_OPCODES else "base"
+    else:
+        profile = normalize_profile(profile)
+    logger.info("Selected %s capability profile", profile)
+
+    pg = WASMMachine(program=instructions, profile=profile).build()
     logger.info(
         "  %d dims, %d lookups, %d input tokens, %d output tokens",
         len(pg.all_dims),
@@ -118,12 +125,13 @@ def main():
     parser.add_argument(
         "--save-weights", type=str, default=None, help="Save specialized weights to binary file"
     )
+    parser.add_argument("--profile", choices=("auto", "base", "full"), default="auto")
     args = parser.parse_args()
 
     prog_file = args.program
     name = os.path.basename(prog_file).replace(".txt", "")
 
-    model, all_tokens, tok_to_idx_map, instructions = specialize(prog_file)
+    model, all_tokens, tok_to_idx_map, instructions = specialize(prog_file, profile=args.profile)
 
     d_model = model.tok.weight.shape[1]
     n_layers = len(model.attn)

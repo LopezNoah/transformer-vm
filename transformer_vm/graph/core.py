@@ -441,8 +441,41 @@ class ProgramGraph:
     def __init__(self, input_tokens, output_tokens):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
-        self.all_dims = list(_all_dims)
-        self.all_lookups = list(_all_lookups)
+        reachable_dims = {one, position, inv_log_pos, position_sq}
+        reachable_lookups = set()
+
+        def visit_expr(expr):
+            for dim in expr.terms:
+                visit_dim(dim)
+
+        def visit_dim(dim):
+            if dim in reachable_dims:
+                return
+            reachable_dims.add(dim)
+            if isinstance(dim, ReGLUDimension):
+                visit_expr(dim.a_expr)
+                visit_expr(dim.b_expr)
+            elif isinstance(dim, PersistDimension):
+                visit_expr(dim.expr)
+            elif isinstance(dim, CumSumDimension):
+                visit_expr(dim.value_expr)
+            elif isinstance(dim, LookUpDimension):
+                lookup = dim.lookup
+                if lookup in reachable_lookups:
+                    return
+                reachable_lookups.add(lookup)
+                for lookup_dim in lookup.dims:
+                    reachable_dims.add(lookup_dim)
+                for dependency in (
+                    lookup.value_exprs + lookup.query_exprs_2d + lookup.key_exprs_2d
+                ):
+                    visit_expr(dependency)
+
+        for expr in list(input_tokens.values()) + list(output_tokens.values()):
+            visit_expr(expr)
+
+        self.all_dims = [dim for dim in _all_dims if dim in reachable_dims]
+        self.all_lookups = [lookup for lookup in _all_lookups if lookup in reachable_lookups]
         self.one = one
         self.position = position
         self.inv_log_pos = inv_log_pos

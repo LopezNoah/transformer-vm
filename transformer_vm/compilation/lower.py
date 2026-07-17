@@ -162,6 +162,18 @@ LOWERABLE_BINOPS = {
     OP_I32_ROTL,
     OP_I32_ROTR,
 }
+NATIVE_CRYPTO_OPS = frozenset(
+    {
+        OP_I32_AND,
+        OP_I32_OR,
+        OP_I32_XOR,
+        OP_I32_SHL,
+        OP_I32_SHR_S,
+        OP_I32_SHR_U,
+        OP_I32_ROTL,
+        OP_I32_ROTR,
+    }
+)
 LOWERABLE_UNARY = {OP_I32_EXTEND8_S, OP_I32_EXTEND16_S, OP_I32_CLZ, OP_I32_CTZ, OP_I32_POPCNT}
 
 
@@ -1295,7 +1307,12 @@ def _mask_shift_count(local_count: int, local_byte: int) -> list[WasmInstr]:
     ]
 
 
-def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = True) -> FuncBody:
+def lower_hard_ops(
+    func: FuncBody,
+    num_params: int = 0,
+    native_crypto: bool = True,
+    enabled_opcodes: set[int] | frozenset[int] | None = None,
+) -> FuncBody:
     """Lower hard-to-simulate instructions in a function body.
 
     Returns a new FuncBody with hard ops replaced by basic instruction
@@ -1304,24 +1321,21 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
     Args:
         func: The original function body.
         num_params: Number of function parameters (local indices start after these).
-        native_crypto: Preserve native bitwise, shift, and rotate instructions. Set
-            to false only to compare against the legacy lowered implementation.
+        native_crypto: Compatibility shorthand controlling native crypto when
+            enabled_opcodes is not supplied.
+        enabled_opcodes: Target opcode capability set. Native crypto operations
+            absent from this set are lowered to base instructions.
     """
     instrs = func.instructions
     needs_lowering = False
 
     # Check if any lowering is needed
-    native_ops = {
-        OP_I32_AND,
-        OP_I32_OR,
-        OP_I32_XOR,
-        OP_I32_SHL,
-        OP_I32_SHR_S,
-        OP_I32_SHR_U,
-        OP_I32_ROTL,
-        OP_I32_ROTR,
-    }
-    lowerable_binops = LOWERABLE_BINOPS - native_ops if native_crypto else LOWERABLE_BINOPS
+    native_ops = (
+        NATIVE_CRYPTO_OPS & enabled_opcodes
+        if enabled_opcodes is not None
+        else NATIVE_CRYPTO_OPS if native_crypto else frozenset()
+    )
+    lowerable_binops = LOWERABLE_BINOPS - native_ops
     for ins in instrs:
         if ins.opcode in lowerable_binops or ins.opcode in LOWERABLE_UNARY:
             needs_lowering = True
@@ -1424,7 +1438,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
 
         # Runtime SHL (no preceding const): a b i32.shl
         # Loop b times, doubling a each iteration via ADD
-        if ins.opcode == OP_I32_SHL:
+        if ins.opcode == OP_I32_SHL and ins.opcode in lowerable_binops:
             local_a = temp_base
             local_b = temp_base + 1
             new_instrs.extend(
@@ -1457,7 +1471,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
 
         # Runtime SHR_U (no preceding const): a b i32.shr_u
         # Loop b times, halving a each iteration via div-by-2 subtraction loop
-        if ins.opcode == OP_I32_SHR_U:
+        if ins.opcode == OP_I32_SHR_U and ins.opcode in lowerable_binops:
             local_a = temp_base
             local_b = temp_base + 1
             local_q = temp_base + 2
@@ -1508,7 +1522,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
             continue
 
         # Runtime SHR_S (no preceding const): arithmetic right shift.
-        if ins.opcode == OP_I32_SHR_S:
+        if ins.opcode == OP_I32_SHR_S and ins.opcode in lowerable_binops:
             local_a = temp_base
             local_b = temp_base + 1
             local_q = temp_base + 2
@@ -1670,19 +1684,19 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
             continue
 
         # Runtime bitwise operations with two variable operands.
-        if ins.opcode == OP_I32_XOR:
+        if ins.opcode == OP_I32_XOR and ins.opcode in lowerable_binops:
             new_instrs.extend(_expand_bitop_variable("xor", temp_base))
             i += 1
             lowered_count += 1
             continue
 
-        if ins.opcode == OP_I32_AND:
+        if ins.opcode == OP_I32_AND and ins.opcode in lowerable_binops:
             new_instrs.extend(_expand_bitop_variable("and", temp_base))
             i += 1
             lowered_count += 1
             continue
 
-        if ins.opcode == OP_I32_OR:
+        if ins.opcode == OP_I32_OR and ins.opcode in lowerable_binops:
             new_instrs.extend(_expand_bitop_variable("or", temp_base))
             i += 1
             lowered_count += 1
@@ -1767,7 +1781,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
             continue
 
         # Runtime ROTL (no preceding const): loop b times rotating left by 1
-        if ins.opcode == OP_I32_ROTL:
+        if ins.opcode == OP_I32_ROTL and ins.opcode in lowerable_binops:
             local_a = temp_base
             local_b = temp_base + 1
             local_bit = temp_base + 2
@@ -1824,7 +1838,7 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
             continue
 
         # Runtime ROTR (no preceding const): convert to ROTL by (32 - b%32)%32
-        if ins.opcode == OP_I32_ROTR:
+        if ins.opcode == OP_I32_ROTR and ins.opcode in lowerable_binops:
             local_a = temp_base
             local_b = temp_base + 1
             local_bit = temp_base + 2
@@ -1946,15 +1960,20 @@ def lower_hard_ops(func: FuncBody, num_params: int = 0, native_crypto: bool = Tr
 # ===================================================================== #
 
 
-def check_basic_only(func: FuncBody, func_index: int = 0) -> dict[str, int]:
+def check_basic_only(
+    func: FuncBody,
+    func_index: int = 0,
+    enabled_opcodes: set[int] | frozenset[int] | None = None,
+) -> dict[str, int]:
     """Check that a function body uses only basic ops.
 
     Returns a dict mapping unsupported op names to their occurrence count.
     Empty dict means all instructions are basic.
     """
+    allowed = BASIC_OPS if enabled_opcodes is None else BASIC_OPS & enabled_opcodes
     bad: dict[str, int] = {}
     for ins in func.instructions:
-        if ins.opcode not in BASIC_OPS:
+        if ins.opcode not in allowed:
             name = WASM_OP_NAMES.get(ins.opcode, f"0x{ins.opcode:02x}")
             bad[name] = bad.get(name, 0) + 1
     return bad

@@ -20,6 +20,8 @@ import yaml
 logger = logging.getLogger(__name__)
 
 HARD_K = 1e10  # softmax temperature scaling to approximate hardmax (argmax) attention
+_SPARSE_MAGIC = b"TVMSPAR\0"
+_SPARSE_VERSION = 1
 
 
 def _dump_allocation(
@@ -113,6 +115,7 @@ def build_model(
     max_layers=None,
     no_reuse=False,
     max_ffn=None,
+    profile="full",
 ):
     """Build transformer weights from a computation graph.
 
@@ -131,7 +134,6 @@ def build_model(
         LookUpDimension,
         PersistDimension,
         ReGLUDimension,
-        _all_dims,
     )
     from transformer_vm.model.transformer import VanillaTransformer as TinyTransformerLM
 
@@ -176,15 +178,17 @@ def build_model(
             _inv_log_pos = pg.inv_log_pos
             _position_sq = pg.position_sq
         else:
-            from transformer_vm.graph.core import inv_log_pos, one, position, position_sq
-            from transformer_vm.wasm.interpreter import build as build_graph
+            from transformer_vm.wasm.interpreter import WASMMachine
 
-            input_tokens, output_tokens = build_graph()
-            ALL_DIMS = list(_all_dims)
-            _one = one
-            _position = position
-            _inv_log_pos = inv_log_pos
-            _position_sq = position_sq
+            pg = WASMMachine(profile=profile).build()
+            program_graph = pg
+            input_tokens = pg.input_tokens
+            output_tokens = pg.output_tokens
+            ALL_DIMS = pg.all_dims
+            _one = pg.one
+            _position = pg.position
+            _inv_log_pos = pg.inv_log_pos
+            _position_sq = pg.position_sq
 
         # ── Load schedule ─────────────────────────────────────────
         if plan_path:
@@ -647,11 +651,17 @@ def flops_per_token(model):
 
 
 def save_weights(model, all_tokens, path):
-    """Save model weights as a flat binary file for the C++ inference engine."""
+    """Save a little-endian, versioned CSR model artifact for both runtimes.
+
+    Each projection stores ``(rows:u32, cols:u32, nnz:u64, row_ptr:u32[],
+    columns:u32[], values:f64[])`` after the model header and vocabulary.
+    """
     import struct
 
     n_layers = len(model.attn)
     with open(path, "wb") as f:
+        f.write(_SPARSE_MAGIC)
+        f.write(struct.pack("<I", _SPARSE_VERSION))
         f.write(
             struct.pack(
                 "<6i",
@@ -669,7 +679,18 @@ def save_weights(model, all_tokens, path):
             f.write(b)
 
         def W(t):
-            f.write(t.detach().contiguous().cpu().numpy().tobytes())
+            t = t.detach().cpu()
+            rows, cols = t.shape
+            indices = t.nonzero(as_tuple=False)
+            values = t[indices[:, 0], indices[:, 1]].contiguous()
+            counts = torch.bincount(indices[:, 0], minlength=rows)
+            ptr = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
+            f.write(struct.pack("<IIQ", rows, cols, len(values)))
+            f.write(ptr.to(torch.uint32).numpy().astype("<u4", copy=False).tobytes())
+            f.write(
+                indices[:, 1].to(torch.uint32).contiguous().numpy().astype("<u4", copy=False).tobytes()
+            )
+            f.write(values.numpy().astype("<f8", copy=False).tobytes())
 
         W(model.tok.weight)
         for li in range(n_layers):
@@ -678,6 +699,21 @@ def save_weights(model, all_tokens, path):
             W(model.ff_in[li].weight)
             W(model.ff_out[li].weight)
         W(model.head.weight)
+
+        projections = [("embedding", model.tok.weight)]
+        for li in range(n_layers):
+            projections.extend(
+                (
+                    (f"attn.{li}.qkv", model.attn[li].in_proj_weight),
+                    (f"attn.{li}.out", model.attn[li].out_proj.weight),
+                    (f"ffn.{li}.in", model.ff_in[li].weight),
+                    (f"ffn.{li}.out", model.ff_out[li].weight),
+                )
+            )
+        projections.append(("head", model.head.weight))
+        for name, weight in projections:
+            nnz = torch.count_nonzero(weight).item()
+            logger.info("  sparse %s: %d/%d nonzero", name, nnz, weight.numel())
 
         has_erase = hasattr(model, "attn_erase")
         f.write(struct.pack("<i", 1 if has_erase else 0))
@@ -703,6 +739,28 @@ def save_weights(model, all_tokens, path):
     logger.info("Saved weights to %s (%s bytes)", path, f"{os.path.getsize(path):,}")
 
 
+def load_vocabulary(path):
+    """Read only the token vocabulary from a saved model artifact."""
+    import struct
+
+    with open(path, "rb") as f:
+        magic = f.read(len(_SPARSE_MAGIC))
+        if magic == _SPARSE_MAGIC:
+            version = struct.unpack("<I", f.read(4))[0]
+            if version != _SPARSE_VERSION:
+                raise ValueError(f"unsupported sparse model version {version}")
+            vocab = struct.unpack("<i", f.read(4))[0]
+        else:
+            f.seek(0)
+            vocab = struct.unpack("<i", f.read(4))[0]
+        f.seek(20, 1)
+        tokens = []
+        for _ in range(vocab):
+            size = struct.unpack("<I", f.read(4))[0]
+            tokens.append(f.read(size).decode())
+    return tokens
+
+
 def load_weights(path):
     """Load model weights from a binary file produced by save_weights().
 
@@ -715,6 +773,14 @@ def load_weights(path):
     from transformer_vm.model.transformer import VanillaTransformer as TinyTransformerLM
 
     with open(path, "rb") as f:
+        magic = f.read(len(_SPARSE_MAGIC))
+        sparse_format = magic == _SPARSE_MAGIC
+        if sparse_format:
+            version = struct.unpack("<I", f.read(4))[0]
+            if version != _SPARSE_VERSION:
+                raise ValueError(f"unsupported sparse model version {version}")
+        else:
+            f.seek(0)
         vocab, d_model, n_layers, n_heads, d_ffn, stop_token_id = struct.unpack("<6i", f.read(24))
 
         all_tokens = []
@@ -742,14 +808,52 @@ def load_weights(path):
             data = np.frombuffer(f.read(n * 8), dtype=np.float64)
             return torch.from_numpy(data.copy()).reshape(shape)
 
+        sparse_projections = {}
+
+        def SR(name, shape):
+            rows, cols, nnz = struct.unpack("<IIQ", f.read(16))
+            if (rows, cols) != shape:
+                raise ValueError(f"invalid sparse shape for {name}: {(rows, cols)} != {shape}")
+            ptr = np.frombuffer(f.read((rows + 1) * 4), dtype="<u4").astype(np.int64)
+            col = np.frombuffer(f.read(nnz * 4), dtype="<u4").astype(np.int64)
+            values = np.frombuffer(f.read(nnz * 8), dtype="<f8").copy()
+            if ptr[0] != 0 or ptr[-1] != nnz or (ptr[1:] < ptr[:-1]).any() or (col >= cols).any():
+                raise ValueError(f"invalid sparse data for {name}")
+            sparse_projections[name] = torch.sparse_csr_tensor(
+                torch.from_numpy(ptr), torch.from_numpy(col), torch.from_numpy(values), size=shape
+            )
+
         with torch.no_grad():
-            model.tok.weight.copy_(R((vocab, d_model)))
+            if sparse_format:
+                SR("embedding", (vocab, d_model))
+            else:
+                model.tok.weight.copy_(R((vocab, d_model)))
             for li in range(n_layers):
-                model.attn[li].in_proj_weight.copy_(R((3 * d_model, d_model)))
-                model.attn[li].out_proj.weight.copy_(R((d_model, d_model)))
-                model.ff_in[li].weight.copy_(R((2 * d_ffn, d_model)))
-                model.ff_out[li].weight.copy_(R((d_model, d_ffn)))
-            model.head.weight.copy_(R((vocab, d_model)))
+                if sparse_format:
+                    SR(f"attn.{li}.qkv", (3 * d_model, d_model))
+                    SR(f"attn.{li}.out", (d_model, d_model))
+                    SR(f"ffn.{li}.in", (2 * d_ffn, d_model))
+                    SR(f"ffn.{li}.out", (d_model, d_ffn))
+                else:
+                    model.attn[li].in_proj_weight.copy_(R((3 * d_model, d_model)))
+                    model.attn[li].out_proj.weight.copy_(R((d_model, d_model)))
+                    model.ff_in[li].weight.copy_(R((2 * d_ffn, d_model)))
+                    model.ff_out[li].weight.copy_(R((d_model, d_ffn)))
+            if sparse_format:
+                SR("head", (vocab, d_model))
+            else:
+                model.head.weight.copy_(R((vocab, d_model)))
+
+        if sparse_format:
+            model.sparse_projections = sparse_projections
+            model.inactive_layers = tuple(
+                li
+                for li in range(n_layers)
+                if not any(
+                    sparse_projections[f"{kind}.{li}.{part}"]._nnz()
+                    for kind, part in (("attn", "qkv"), ("attn", "out"), ("ffn", "in"), ("ffn", "out"))
+                )
+            )
 
         has_erase = struct.unpack("<i", f.read(4))[0]
         if has_erase:

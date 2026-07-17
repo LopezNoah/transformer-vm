@@ -38,6 +38,17 @@ class VanillaTransformer(nn.Module):
         )
         self.head = nn.Linear(d_model, vocab, bias=False)
 
+    def _project(self, name, dense_weight, x):
+        """Use the serialized CSR projection when one is available."""
+        sparse = getattr(self, "sparse_projections", {}).get(name)
+        return torch.mv(sparse, x) if sparse is not None else dense_weight @ x
+
+    def _embedding(self, token_id):
+        sparse = getattr(self, "sparse_projections", {}).get("embedding")
+        if sparse is None:
+            return self.tok.weight[token_id].clone()
+        return sparse[token_id].to_dense()
+
     @torch.no_grad()
     def generate_with_cache(self, idx, max_new_tokens=5000, cache_class=HullKVCache):
         """Generate tokens using a KV cache for O(n) or O(log n) inference."""
@@ -52,21 +63,25 @@ class VanillaTransformer(nn.Module):
         idx_list = idx[0].tolist()
 
         for pos in range(len(idx_list) + max_new_tokens):
-            x = self.tok.weight[idx_list[pos]].clone()
+            x = self._embedding(idx_list[pos])
             add_position_encoding(x, pos)
 
             for layer_idx, (attn, ff_in, ff_out) in enumerate(
                 zip(self.attn, self.ff_in, self.ff_out, strict=True)
             ):
-                q, k, v = (attn.in_proj_weight @ x).chunk(3, dim=-1)
+                if layer_idx in getattr(self, "inactive_layers", ()):
+                    continue
+                q, k, v = self._project(f"attn.{layer_idx}.qkv", attn.in_proj_weight, x).chunk(
+                    3, dim=-1
+                )
                 out = cache.layer_step(layer_idx, k, q, v)
-                x = x + attn.out_proj(out)
+                x = x + self._project(f"attn.{layer_idx}.out", attn.out_proj.weight, out)
 
-                gate, val = ff_in(x).chunk(2, dim=-1)
-                x = x + ff_out(F.relu(gate) * val)
+                gate, val = self._project(f"ffn.{layer_idx}.in", ff_in.weight, x).chunk(2, dim=-1)
+                x = x + self._project(f"ffn.{layer_idx}.out", ff_out.weight, F.relu(gate) * val)
 
             if pos + 1 == len(idx_list):
-                next_id = self.head(x).argmax().item()
+                next_id = self._project("head", self.head.weight, x).argmax().item()
                 idx_list.append(next_id)
                 terminal_token_ids = getattr(self, "terminal_token_ids", {self.stop_token_id})
                 if next_id in terminal_token_ids:

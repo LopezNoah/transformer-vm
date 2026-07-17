@@ -570,20 +570,29 @@ def format_spec_input(input_str: str = "") -> str:
     return " ".join(tokens) + "\n"
 
 
-def compile_wasm_to_prefix(wasm_path: str) -> tuple[str, int]:
+def compile_wasm_to_prefix(wasm_path: str, profile: str = "auto") -> tuple[str, int]:
     """Full pipeline: WASM -> lower -> prefix string.
 
     Returns (prefix_string, input_base).
     Program does NOT contain input data — use input_base to load it at runtime.
     """
+    from transformer_vm.compilation.lower import BASIC_OPS, NATIVE_CRYPTO_OPS
+
+    profile = profile.lower()
+    if profile == "crypto":
+        profile = "full"
+    if profile not in {"auto", "base", "full"}:
+        raise ValueError(f"Unknown capability profile: {profile}")
+    enabled_opcodes = BASIC_OPS - NATIVE_CRYPTO_OPS if profile == "base" else BASIC_OPS
+
     with open(wasm_path, "rb") as f:
         mod = decode(f.read())
 
     for fi, func in enumerate(mod.functions):
         type_idx = mod.func_type_indices[fi]
         num_params = len(mod.types[type_idx].params)
-        lowered = lower_hard_ops(func, num_params)
-        unsupported = check_basic_only(lowered, fi)
+        lowered = lower_hard_ops(func, num_params, enabled_opcodes=enabled_opcodes)
+        unsupported = check_basic_only(lowered, fi, enabled_opcodes=enabled_opcodes)
         if unsupported:
             details = ", ".join(
                 f"{name} ({count})" for name, count in sorted(unsupported.items())
@@ -600,7 +609,12 @@ def compile_wasm_to_prefix(wasm_path: str) -> tuple[str, int]:
 # ── Compile one program end-to-end ────────────────────────────────
 
 
-def compile_program(input_path: str, args_str: str = "", out_base: str | None = None):
+def compile_program(
+    input_path: str,
+    args_str: str = "",
+    out_base: str | None = None,
+    profile: str = "auto",
+):
     """Compile a C or WASM file to token-prefix format.
 
     Args:
@@ -619,7 +633,11 @@ def compile_program(input_path: str, args_str: str = "", out_base: str | None = 
         out_base = os.path.join(DATA_DIR, name)
     out_dir = os.path.dirname(out_base)
 
-    prefix, input_base = compile_wasm_to_prefix(wasm_path)
+    prefix, input_base = compile_wasm_to_prefix(wasm_path, profile=profile)
+    from transformer_vm.wasm.interpreter import CRYPTO_OPCODES
+
+    selected_profile = "full" if set(prefix.split()) & CRYPTO_OPCODES else "base"
+    logger.info("%s: selected %s capability profile", name, selected_profile)
     program = prefix.split("\n")
     program_body = [line for line in program if line not in ("{", "}", "")]
 
@@ -658,7 +676,7 @@ def load_manifest():
         return yaml.safe_load(f)["programs"]
 
 
-def compile_all():
+def compile_all(profile: str = "auto"):
     """Compile all programs listed in the manifest."""
     from transformer_vm._paths import EXAMPLES_DIR
 
@@ -670,11 +688,11 @@ def compile_all():
         if not os.path.exists(c_path):
             logger.warning("Skipping %s: %s not found", name, c_path)
             continue
-        compile_program(c_path, args_str)
+        compile_program(c_path, args_str, profile=profile)
     logger.info("Compiled %d programs from manifest", len(manifest))
 
 
-def ensure_data(generate_refs: bool = True):
+def ensure_data(generate_refs: bool = True, profile: str = "auto"):
     """Compile all programs from the manifest and generate reference traces if missing."""
     from transformer_vm._paths import DATA_DIR, EXAMPLES_DIR
 
@@ -687,7 +705,7 @@ def ensure_data(generate_refs: bool = True):
             c_path = os.path.join(EXAMPLES_DIR, f"{name}.c")
             if os.path.exists(c_path):
                 logger.info("Compiling missing program: %s", name)
-                compile_program(c_path, entry.get("args", ""))
+                compile_program(c_path, entry.get("args", ""), profile=profile)
             else:
                 logger.warning("Skipping %s: %s not found", name, c_path)
 
@@ -713,16 +731,17 @@ def main():
     parser.add_argument(
         "--all", action="store_true", help="Compile all programs from manifest.yaml"
     )
+    parser.add_argument("--profile", choices=("auto", "base", "full"), default="auto")
     args = parser.parse_args()
 
     if args.all:
-        compile_all()
+        compile_all(profile=args.profile)
         return
 
     if not args.input:
         parser.error("input is required (or use --all)")
 
-    compile_program(args.input, args.args, args.output)
+    compile_program(args.input, args.args, args.output, profile=args.profile)
 
 
 if __name__ == "__main__":

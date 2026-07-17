@@ -30,8 +30,6 @@ static constexpr int MAX_GEN = 6000000;
 
 // ── Model ──────────────────────────────────────────────────────────────
 
-struct Layer { const double *qkv, *out, *fi, *fo; };
-
 struct SparseMatrix {
     std::vector<double> val;
     std::vector<int>    col;
@@ -40,6 +38,7 @@ struct SparseMatrix {
 
     void build(const double* dense, int r, int c) {
         rows = r; cols = c; nnz = 0;
+        val.clear(); col.clear();
         ptr.resize(r + 1);
         for (int i = 0; i < r; i++) {
             ptr[i] = nnz;
@@ -55,23 +54,87 @@ struct SparseMatrix {
     }
 };
 
+struct DenseMatrix {
+    std::vector<double> val;
+    int rows = 0, cols = 0;
+
+    void build(const SparseMatrix& sparse) {
+        rows = sparse.rows; cols = sparse.cols;
+        val.assign((size_t)rows * cols, 0.0);
+        for (int i = 0; i < rows; i++)
+            for (int k = sparse.ptr[i]; k < sparse.ptr[i + 1]; k++)
+                val[(size_t)i * cols + sparse.col[k]] = sparse.val[k];
+    }
+};
+
+struct Layer {
+    SparseMatrix qkv, out, fi, fo;
+    DenseMatrix dense_qkv, dense_out, dense_fi, dense_fo;
+    std::vector<bool> active_heads;
+    bool active = true;
+};
+
 struct Model {
     int V, D, L, H, F, stop;
     std::vector<std::string> name;
     std::unordered_map<std::string, int> id;
-    std::vector<double> w;
-    const double* emb{};
+    SparseMatrix emb;
+    DenseMatrix dense_emb;
     std::vector<Layer> ly;
-    const double* head{};
-    SparseMatrix head_sp;
+    SparseMatrix head;
+    DenseMatrix dense_head;
+    bool dense = false;
     std::vector<std::vector<int>> attn_erase;
     std::vector<std::vector<int>> ffn_erase;
     std::vector<std::vector<TieBreak>> head_tb;
 };
 
+static void read_sparse(FILE* f, SparseMatrix& s) {
+    uint32_t rows, cols;
+    uint64_t nnz;
+    if (fread(&rows, 4, 1, f) != 1 || fread(&cols, 4, 1, f) != 1 || fread(&nnz, 8, 1, f) != 1)
+        { fprintf(stderr, "truncated sparse matrix header\n"); exit(1); }
+    s.rows = rows; s.cols = cols; s.nnz = nnz;
+    s.ptr.resize((size_t)rows + 1); s.col.resize(nnz); s.val.resize(nnz);
+    if (fread(s.ptr.data(), 4, (size_t)rows + 1, f) != (size_t)rows + 1
+        || fread(s.col.data(), 4, nnz, f) != nnz || fread(s.val.data(), 8, nnz, f) != nnz
+        || s.ptr.back() != (int)nnz) { fprintf(stderr, "invalid sparse matrix\n"); exit(1); }
+    for (int i = 0; i < rows; i++)
+        if (s.ptr[i] > s.ptr[i + 1]) { fprintf(stderr, "invalid sparse row pointers\n"); exit(1); }
+    for (int c : s.col)
+        if (c < 0 || c >= (int)cols) { fprintf(stderr, "invalid sparse column\n"); exit(1); }
+}
+
+static void finalize_model(Model& m) {
+    for (auto& l : m.ly) {
+        l.active = l.qkv.nnz || l.out.nnz || l.fi.nnz || l.fo.nnz;
+        l.active_heads.resize(m.H, false);
+        for (int h = 0; h < m.H; h++) {
+            for (int row = 0; row < m.D && !l.active_heads[h]; row++)
+                for (int k = l.out.ptr[row]; k < l.out.ptr[row + 1]; k++)
+                    if (l.out.col[k] == 2 * h || l.out.col[k] == 2 * h + 1) {
+                        l.active_heads[h] = true; break;
+                    }
+        }
+        if (m.dense) {
+            l.dense_qkv.build(l.qkv); l.dense_out.build(l.out);
+            l.dense_fi.build(l.fi); l.dense_fo.build(l.fo);
+        }
+    }
+    if (m.dense) { m.dense_emb.build(m.emb); m.dense_head.build(m.head); }
+}
+
 static void load(Model& m, const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    char magic[8];
+    bool sparse = fread(magic, 1, 8, f) == 8 && memcmp(magic, "TVMSPAR\0", 8) == 0;
+    if (sparse) {
+        uint32_t version;
+        if (fread(&version, 4, 1, f) != 1 || version != 1) { fprintf(stderr, "unsupported sparse model\n"); exit(1); }
+    } else {
+        rewind(f);
+    }
     int32_t h[6];
     if (fread(h, 4, 6, f) != 6) { fprintf(stderr, "bad header\n"); exit(1); }
     m.V = h[0];
@@ -91,25 +154,30 @@ static void load(Model& m, const char* path) {
     }
 
     int D = m.D, L = m.L, F = m.F, V = m.V;
-    size_t per = (size_t)(3*D*D + D*D + 2*F*D + D*F);
-    size_t tot = (size_t)V*D + L*per + (size_t)V*D;
-    m.w.resize(tot);
-    if (fread(m.w.data(), 8, tot, f) != tot) {
-        fprintf(stderr, "truncated weight file\n"); exit(1);
-    }
-
-    const double* p = m.w.data();
-    m.emb = p; p += V*D;
     m.ly.resize(L);
-    for (int i = 0; i < L; i++) {
-        auto& l = m.ly[i];
-        l.qkv = p; p += 3*D*D;
-        l.out = p; p += D*D;
-        l.fi  = p; p += 2*F*D;
-        l.fo  = p; p += D*F;
+    if (sparse) {
+        read_sparse(f, m.emb);
+        for (int i = 0; i < L; i++) {
+            read_sparse(f, m.ly[i].qkv); read_sparse(f, m.ly[i].out);
+            read_sparse(f, m.ly[i].fi); read_sparse(f, m.ly[i].fo);
+        }
+        read_sparse(f, m.head);
+    } else {
+        size_t per = (size_t)(3*D*D + D*D + 2*F*D + D*F);
+        size_t tot = (size_t)V*D + L*per + (size_t)V*D;
+        std::vector<double> w(tot);
+        if (fread(w.data(), 8, tot, f) != tot) { fprintf(stderr, "truncated weight file\n"); exit(1); }
+        const double* p = w.data();
+        m.emb.build(p, V, D); p += V*D;
+        for (int i = 0; i < L; i++) {
+            auto& l = m.ly[i];
+            l.qkv.build(p, 3*D, D); p += 3*D*D;
+            l.out.build(p, D, D); p += D*D;
+            l.fi.build(p, 2*F, D); p += 2*F*D;
+            l.fo.build(p, D, F); p += D*F;
+        }
+        m.head.build(p, V, D);
     }
-    m.head = p;
-
     int32_t has_erase = 0;
     if (fread(&has_erase, 4, 1, f) == 1 && has_erase) {
         m.attn_erase.resize(L);
@@ -140,9 +208,9 @@ static void load(Model& m, const char* path) {
     }
     fclose(f);
 
-    m.head_sp.build(m.head, V, D);
+    finalize_model(m);
     printf("Head sparsity: %d/%d nonzero (%.0f%% sparse)\n",
-           m.head_sp.nnz, V * D, 100.0 * (1.0 - (double)m.head_sp.nnz / (V * D)));
+            m.head.nnz, V * D, 100.0 * (1.0 - (double)m.head.nnz / (V * D)));
 }
 
 // ── Position encoding ──────────────────────────────────────────────────
@@ -171,6 +239,18 @@ static inline void matvec(const double* __restrict__ W,
 #endif
 }
 
+static inline void matvec(const SparseMatrix& W, const double* x, double* y) {
+    for (int i = 0; i < W.rows; i++) {
+        double s = 0;
+        for (int k = W.ptr[i]; k < W.ptr[i + 1]; k++) s += W.val[k] * x[W.col[k]];
+        y[i] = s;
+    }
+}
+
+static inline void matvec(const DenseMatrix& W, const double* x, double* y) {
+    matvec(W.val.data(), x, y, W.rows, W.cols);
+}
+
 // ── Timing ─────────────────────────────────────────────────────────────
 
 using Clock = std::chrono::steady_clock;
@@ -183,16 +263,17 @@ static inline double secs(TP a, TP b) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s model.bin [--regen] [--trace[=N]] [--brute|--nohull] [--args=STR] prog1.txt [...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s model.bin [--dense] [--regen] [--trace[=N]] [--brute|--nohull] [--args=STR] prog1.txt [...]\n", argv[0]);
         return 1;
     }
 
-    bool regen = false, brute = false;
+    bool regen = false, brute = false, dense = false;
     int trace_every = 0;
     const char* trace_file = nullptr;
     const char* args_str = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--regen") == 0) regen = true;
+        if (strcmp(argv[i], "--dense") == 0) dense = true;
         if (strcmp(argv[i], "--brute") == 0 || strcmp(argv[i], "--nohull") == 0) brute = true;
         if (strncmp(argv[i], "--trace", 7) == 0) {
             trace_every = 1;
@@ -205,7 +286,9 @@ int main(int argc, char** argv) {
     if (brute) printf("Using brute-force O(n) KV cache\n");
 
     Model m;
+    m.dense = dense;
     load(m, argv[1]);
+    if (dense) printf("Using dense projection benchmark mode\n");
     printf("Loaded: vocab=%d D=%d layers=%d heads=%d d_ffn=%d\n",
            m.V, m.D, m.L, m.H, m.F);
 
@@ -286,20 +369,29 @@ int main(int argc, char** argv) {
         bool trapped = false;
 
         for (int pos = 0; pos < plen + max_gen; pos++) {
-            const double* e = m.emb + ids[pos] * D;
-            std::copy(e, e + D, x.data());
+            if (dense) {
+                const double* e = m.dense_emb.val.data() + (size_t)ids[pos] * D;
+                std::copy(e, e + D, x.data());
+            } else {
+                std::fill(x.begin(), x.end(), 0.0);
+                for (int k = m.emb.ptr[ids[pos]]; k < m.emb.ptr[ids[pos] + 1]; k++)
+                    x[m.emb.col[k]] = m.emb.val[k];
+            }
             add_position_encoding(x.data(), pos);
 
             for (int l = 0; l < L; l++) {
                 const auto& ly = m.ly[l];
+                if (!dense && !ly.active) continue;
 
                 auto ta = Clock::now();
-                matvec(ly.qkv, x.data(), qkv.data(), 3*D, D);
+                if (dense) matvec(ly.dense_qkv, x.data(), qkv.data());
+                else matvec(ly.qkv, x.data(), qkv.data());
                 auto tb = Clock::now();
 
                 double *q = qkv.data(), *k = q + D, *v = k + D;
                 int base = l * H;
                 for (int h = 0; h < H; h++) {
+                    if (!dense && !ly.active_heads[h]) { ho[h * 2] = ho[h * 2 + 1] = 0.0; continue; }
                     TieBreak tb = (!m.head_tb.empty()) ? m.head_tb[l][h] : TieBreak::AVERAGE;
                     if (brute) {
                         brutes[base+h].insert(&k[h*2], &v[h*2], seq);
@@ -312,12 +404,15 @@ int main(int argc, char** argv) {
                 seq++;
                 auto tc = Clock::now();
 
-                matvec(ly.out, ho.data(), ao.data(), D, D);
+                if (dense) matvec(ly.dense_out, ho.data(), ao.data());
+                else matvec(ly.out, ho.data(), ao.data());
                 for (int i = 0; i < D; i++) x[i] += ao[i];
-                matvec(ly.fi, x.data(), ff.data(), 2*F, D);
+                if (dense) matvec(ly.dense_fi, x.data(), ff.data());
+                else matvec(ly.fi, x.data(), ff.data());
                 for (int i = 0; i < F; i++)
                     gv[i] = (ff[i] > 0 ? ff[i] : 0.0) * ff[F + i];
-                matvec(ly.fo, gv.data(), fo.data(), D, F);
+                if (dense) matvec(ly.dense_fo, gv.data(), fo.data());
+                else matvec(ly.fo, gv.data(), fo.data());
                 for (int i = 0; i < D; i++) x[i] += fo[i];
                 auto td = Clock::now();
 
@@ -327,12 +422,16 @@ int main(int argc, char** argv) {
 
             if (pos + 1 == (int)ids.size()) {
                 auto te = Clock::now();
-                const auto& sp = m.head_sp;
+                const auto& sp = m.head;
                 int best = 0; double bs = -1e300;
                 for (int i = 0; i < sp.rows; i++) {
                     double s = 0;
-                    for (int k = sp.ptr[i]; k < sp.ptr[i + 1]; k++)
-                        s += sp.val[k] * x[sp.col[k]];
+                    if (dense) {
+                        const double* row = m.dense_head.val.data() + (size_t)i * D;
+                        for (int j = 0; j < D; j++) s += row[j] * x[j];
+                    } else {
+                        for (int k = sp.ptr[i]; k < sp.ptr[i + 1]; k++) s += sp.val[k] * x[sp.col[k]];
+                    }
                     if (s > bs) { bs = s; best = i; }
                 }
                 auto tf = Clock::now();
