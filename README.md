@@ -55,6 +55,35 @@ uv run wasm-compile transformer_vm/examples/collatz.c --args 7
 uv run wasm-run transformer_vm/data/collatz.txt
 ```
 
+### Binary inputs and outputs
+
+`wasm-compile` accepts binary payloads without text decoding. Use `--input-hex`
+for an inline lowercase or uppercase hexadecimal payload, or `--input-file` to
+read bytes directly from a file:
+
+```bash
+uv run wasm-compile crypto.c --input-hex '0001ff80'
+uv run wasm-compile crypto.c --input-file ciphertext.bin
+uv run wasm-reference transformer_vm/data/crypto.txt --output-hex
+```
+
+The VM writes `uint32_le(payload_length) || payload || 0x00` at the input
+allocation. `compute` receives a pointer to `payload`; use
+`tvm_input_length(input)` from `runtime.h` rather than a string operation when
+processing binary data. The final NUL is a compatibility sentinel and is not
+part of the payload. `putchar()` emits raw bytes. `wasm-reference --output-hex`
+and `wasm-run` report output as lowercase, two-characters-per-byte hexadecimal.
+
+For crypto workloads, supply keys, nonces, messages, associated data, and
+ciphertexts as their literal byte sequences, normally with `--input-hex` or
+`--input-file`; do not include separators, prefixes such as `0x`, text
+encodings, or authentication tags unless the program's input format explicitly
+includes them. Define multi-field payload boundaries in the program protocol
+(for example, fixed widths or explicit little-endian lengths). Algorithm byte
+order remains algorithm-specific: SHA-256 digests and ChaCha20 test vectors are
+commonly published in their displayed byte order, while the input frame length
+is always little-endian.
+
 ### Compile all examples from the manifest
 
 ```bash

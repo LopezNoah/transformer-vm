@@ -246,7 +246,7 @@ const fs = require('fs');
         for word in [0x89ABCDEF, 0x01234567, 0xAAAAAAAA, 0x55555555]
     )
     assert bytes(node_output) == expected
-    assert output.encode("latin-1") == expected
+    assert output == expected
     assert halted and not trapped
 
 

@@ -113,12 +113,12 @@ Depends on: `COR-001`, `COR-002`, `COR-005`
 
 ### CRYPTO-002: Support binary-safe inputs and outputs
 
-- [ ] Define a length-delimited binary input representation.
-- [ ] Add CLI support for hex input.
-- [ ] Add CLI support for binary-file input.
-- [ ] Preserve embedded null bytes and non-UTF-8 data.
-- [ ] Add deterministic hex output suitable for known-answer comparisons.
-- [ ] Document key, nonce, message, and ciphertext encoding conventions.
+- [x] Define a length-delimited binary input representation.
+- [x] Add CLI support for hex input.
+- [x] Add CLI support for binary-file input.
+- [x] Preserve embedded null bytes and non-UTF-8 data.
+- [x] Add deterministic hex output suitable for known-answer comparisons.
+- [x] Document key, nonce, message, and ciphertext encoding conventions.
 
 Relevant code: `transformer_vm/compilation/compile_wasm.py`,
 `transformer_vm/runner.py`

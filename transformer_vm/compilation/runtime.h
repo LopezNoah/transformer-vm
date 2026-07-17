@@ -2,8 +2,10 @@
  *
  * Standard interface for C programs compiled to Transformer VM via WebAssembly.
  *
- * Entry point: void compute(const char *input)
- *   - `input` points to a null-terminated string in linear memory
+ * Entry point: void compute(const unsigned char *input)
+ *   - `input` points to the payload in a length-delimited linear-memory input
+ *   - `tvm_input_length(input)` returns the payload length in bytes
+ *   - a compatibility NUL follows the payload for legacy string programs
  *   - Use putchar() to emit output bytes
  *
  * All helpers use always_inline and avoid arrays / address-taken locals
@@ -23,6 +25,14 @@
 
 __attribute__((import_module("env"), import_name("output_byte")))
 void putchar(int ch);
+
+/* Input bytes are preceded by their unsigned little-endian 32-bit length. */
+__attribute__((always_inline))
+static inline unsigned int tvm_input_length(const unsigned char *input) {
+    const unsigned char *length = input - 4;
+    return (unsigned int)length[0] | ((unsigned int)length[1] << 8) |
+           ((unsigned int)length[2] << 16) | ((unsigned int)length[3] << 24);
+}
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 

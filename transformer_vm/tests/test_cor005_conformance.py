@@ -24,7 +24,10 @@ def _run_node_wasm(wasm_path, input_str):
     script = r"""
 const fs = require('fs');
 const bytes = fs.readFileSync(process.argv[1]);
-const input = Buffer.from(process.argv[2] + '\0');
+const payload = Buffer.from(process.argv[2]);
+const input = Buffer.alloc(4 + payload.length + 1);
+input.writeUInt32LE(payload.length, 0);
+payload.copy(input, 4);
 const output = [];
 (async () => {
   try {
@@ -33,7 +36,7 @@ const output = [];
     });
     const memory = new Uint8Array(instance.exports.memory.buffer);
     memory.set(input, instance.exports.__heap_base.value);
-    instance.exports.compute(instance.exports.__heap_base.value);
+    instance.exports.compute(instance.exports.__heap_base.value + 4);
     process.stdout.write(JSON.stringify({status: 'ok', output: Buffer.from(output).toString('base64')}));
   } catch (error) {
     process.stdout.write(JSON.stringify({status: 'trap', output: Buffer.from(output).toString('base64')}));
@@ -121,7 +124,7 @@ def test_reference_matches_node_for_arithmetic_control_memory_locals_and_calls(t
     assert node_status == "ok"
     assert halted
     assert not trapped
-    assert reference_output.encode("latin-1") == node_output
+    assert reference_output == node_output
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="requires the Node WebAssembly runtime")
@@ -138,7 +141,7 @@ def test_reference_matches_node_trap(tmp_path):
 
     assert node_status == "trap"
     assert node_output == b""
-    assert reference_output == ""
+    assert reference_output == b""
     assert not halted
     assert trapped
 

@@ -589,9 +589,9 @@ int main(int argc, char** argv) {
                 skipped++;
             }
             if (!output_bytes.empty()) {
-                printf("  output: ");
+                printf("  output_hex: ");
                 for (unsigned char c : output_bytes)
-                    putchar((c >= 0x20 && c < 0x7f) || c == '\n' || c == '\t' ? c : '.');
+                    printf("%02x", c);
                 putchar('\n');
             }
         }

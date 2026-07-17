@@ -18,6 +18,16 @@ import time
 logger = logging.getLogger(__name__)
 
 
+def _output_hex(tokens):
+    """Return emitted output tokens as lowercase hexadecimal bytes."""
+    output = []
+    for token in tokens:
+        if token.startswith("out(") and token.endswith(")"):
+            value = token[4:-1]
+            output.append(ord(value) if len(value) == 1 else int(value, 16))
+    return bytes(output).hex()
+
+
 # ── Python model inference ────────────────────────────────────────
 
 
@@ -54,6 +64,9 @@ def run_model_program(
 
     if verbose:
         logger.info("  Tokens: %s", " ".join(predicted))
+    output_hex = _output_hex(predicted)
+    if output_hex:
+        logger.info("  output_hex: %s", output_hex)
 
     if ref_file and os.path.exists(ref_file):
         with open(ref_file) as f:

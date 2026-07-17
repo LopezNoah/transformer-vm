@@ -437,7 +437,9 @@ def build_program(mod: WasmModule) -> tuple[list[tuple[str, list[int]]], int]:
     num_locals = param_count + func.num_locals
 
     input_base = _compute_input_base(mod) if param_count > 0 else 0
-    entry_args = [input_base] if param_count > 0 else []
+    # The input allocation starts with a four-byte length. C entry points receive
+    # a pointer to the payload so existing string-oriented programs still work.
+    entry_args = [input_base + 4] if param_count > 0 else []
 
     prologue: list[tuple[str, list[int]]] = []
 
@@ -543,29 +545,32 @@ def format_prefix(program: list[tuple[str, list[int]]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_input_section(input_str: str) -> str:
-    """Format input bytes + commit token for appending after the program."""
-    data = input_str.encode("utf-8") + b"\x00"
+def _format_input_bytes(input_bytes: bytes) -> list[str]:
+    """Encode a length-delimited byte payload as model input tokens."""
+    if len(input_bytes) > 0xFFFFFFFF:
+        raise ValueError("input is too large for the 32-bit Transformer VM input ABI")
+    # The final NUL is outside the declared payload and preserves the legacy C
+    # string ABI. Binary programs must use tvm_input_length(), not this sentinel.
+    data = len(input_bytes).to_bytes(4, "little") + input_bytes + b"\x00"
     tokens = []
     for b in data:
         if 0x20 < b < 0x7F and chr(b) not in ("{", "}"):
             tokens.append(chr(b))
         else:
             tokens.append(f"{b:02x}")
-    tokens.append("commit(+0,sts=0,bt=0)")
-    return " ".join(tokens) + "\n"
+    return tokens
 
 
-def format_spec_input(input_str: str = "") -> str:
-    """Format the specialized model input (start + optional input tokens)."""
+def format_input_section(input_bytes: bytes) -> str:
+    """Format a length-delimited binary input section for a universal model."""
+    return " ".join([*_format_input_bytes(input_bytes), "commit(+0,sts=0,bt=0)"]) + "\n"
+
+
+def format_spec_input(input_bytes: bytes | None = b"") -> str:
+    """Format the specialized model input (start plus binary input tokens)."""
     tokens = ["start"]
-    if input_str:
-        data = input_str.encode("utf-8") + b"\x00"
-        for b in data:
-            if 0x20 < b < 0x7F and chr(b) not in ("{", "}"):
-                tokens.append(chr(b))
-            else:
-                tokens.append(f"{b:02x}")
+    if input_bytes is not None:
+        tokens.extend(_format_input_bytes(input_bytes))
         tokens.append("commit(+0,sts=0,bt=0)")
     return " ".join(tokens) + "\n"
 
@@ -619,6 +624,7 @@ def compile_wasm_to_prefix(wasm_path: str, profile: str = "auto") -> tuple[str, 
 def compile_program(
     input_path: str,
     args_str: str = "",
+    input_bytes: bytes | None = None,
     out_base: str | None = None,
     profile: str = "auto",
 ):
@@ -626,7 +632,8 @@ def compile_program(
 
     Args:
         input_path: Path to .c or .wasm file.
-        args_str: Input string for the program.
+        args_str: UTF-8 input string for the program.
+        input_bytes: Binary input payload. Overrides args_str when provided.
         out_base: Output base path (default: data/<name>).
     """
     wasm_path = input_path
@@ -639,6 +646,9 @@ def compile_program(
 
         out_base = os.path.join(DATA_DIR, name)
     out_dir = os.path.dirname(out_base)
+
+    if input_bytes is None:
+        input_bytes = args_str.encode("utf-8")
 
     prefix, input_base = compile_wasm_to_prefix(wasm_path, profile=profile)
     from transformer_vm.wasm.interpreter import CRYPTO_OPCODES
@@ -653,12 +663,12 @@ def compile_program(
     txt_path = out_base + ".txt"
     with open(txt_path, "w") as f:
         f.write(prefix)
-        if args_str and input_base:
-            f.write(format_input_section(args_str))
+        if input_base:
+            f.write(format_input_section(input_bytes))
 
     spec_path = out_base + "_spec.txt"
     with open(spec_path, "w") as f:
-        f.write(format_spec_input(args_str if input_base else ""))
+        f.write(format_spec_input(input_bytes) if input_base else format_spec_input(None))
 
     # Clean up intermediate .wasm file
     if input_path.endswith(".c") and os.path.exists(wasm_path):
@@ -731,7 +741,10 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("input", nargs="?", help="Path to .c or .wasm file")
-    parser.add_argument("--args", default="", help="Input string for the program")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument("--args", default=None, help="UTF-8 input string for the program")
+    input_group.add_argument("--input-hex", help="Binary input payload encoded as hexadecimal")
+    input_group.add_argument("--input-file", help="Read the binary input payload from this file")
     parser.add_argument(
         "--output", "-o", default=None, help="Output base path (default: data/<name>)"
     )
@@ -748,7 +761,17 @@ def main():
     if not args.input:
         parser.error("input is required (or use --all)")
 
-    compile_program(args.input, args.args, args.output, profile=args.profile)
+    if args.input_hex is not None:
+        try:
+            input_bytes = bytes.fromhex(args.input_hex)
+        except ValueError as exc:
+            parser.error(f"--input-hex must contain complete hexadecimal bytes: {exc}")
+    elif args.input_file is not None:
+        with open(args.input_file, "rb") as f:
+            input_bytes = f.read()
+    else:
+        input_bytes = (args.args or "").encode("utf-8")
+    compile_program(args.input, input_bytes=input_bytes, out_base=args.output, profile=args.profile)
 
 
 if __name__ == "__main__":

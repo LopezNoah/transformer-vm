@@ -1,5 +1,16 @@
 # Transformer VM Benchmarks
 
+## CRYPTO-002 Binary I/O
+
+Binary input framing adds four little-endian length bytes and one compatibility
+NUL to each execution prefix. The payload itself is preserved byte-for-byte,
+including `00` and non-UTF-8 bytes. This is an encoding change rather than a
+runtime-performance benchmark; reproduce its deterministic behavior with:
+
+```bash
+uv run pytest transformer_vm/tests/test_crypto_binary_io.py
+```
+
 ## CRYPTO-001 Native Arithmetic
 
 The native operations were compared with the retained legacy lowering by

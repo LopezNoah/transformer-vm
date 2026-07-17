@@ -78,7 +78,7 @@ def _commit(sd, sts, bt):
 
 
 def load_program(path):
-    """Parse a .txt program file into a list of (op, imm) tuples and input string."""
+    """Parse a .txt program file into a list of instructions and binary input."""
     with open(path) as f:
         tokens = f.read().split()
     program = _parse_program_tokens(tokens)
@@ -111,44 +111,46 @@ def _parse_program_tokens(tokens):
 
 
 def _extract_input(tokens):
-    """Extract the input string from tokens after the closing '}'.
+    """Extract a length-delimited binary payload from tokens after the closing '}'.
 
     The input section is: <byte_tokens...> commit(+0,sts=0,bt=0)
     where byte tokens are either single ASCII chars or 2-digit hex values.
-    Returns the decoded string (without the trailing NUL).
+    Returns payload bytes. The token stream includes its four-byte little-endian
+    length and a compatibility NUL after the payload.
     """
     try:
         end = len(tokens) - 1 - tokens[::-1].index("}")
     except ValueError:
-        return ""
+        return b""
     input_tokens = tokens[end + 1 :]
     if not input_tokens:
-        return ""
+        return b""
     # Drop the trailing commit(...) token
     if input_tokens and input_tokens[-1].startswith("commit("):
         input_tokens = input_tokens[:-1]
-    # Decode byte tokens back to string, stopping at NUL
-    chars = []
+    decoded = []
     for tok in input_tokens:
         if len(tok) == 1:
-            chars.append(tok)
+            decoded.append(ord(tok))
         elif len(tok) == 2:
-            b = int(tok, 16)
-            if b == 0:
-                break
-            chars.append(chr(b))
+            decoded.append(int(tok, 16))
         else:
-            break
-    return "".join(chars)
+            raise ValueError(f"Invalid binary input token: {tok}")
+    if len(decoded) < 5:
+        raise ValueError("Binary input section must contain a 32-bit length and compatibility NUL")
+    payload_len = int.from_bytes(bytes(decoded[:4]), "little")
+    if len(decoded) != payload_len + 5 or decoded[-1] != 0:
+        raise ValueError("Binary input section length or compatibility NUL is invalid")
+    return bytes(decoded[4:-1])
 
 
 # ── WASM interpreter ─────────────────────────────────────────────
 
 
-def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=False):
+def run(program, input_bytes=b"", max_tokens=1_000_000, input_base=None, trace=False):
     """Execute a compiled WASM program.
 
-    Returns (instr_count, token_count, output_str, halted, trapped) or, if trace=True,
+    Returns (instr_count, token_count, output_bytes, halted, trapped) or, if trace=True,
     (instr_count, token_count, output_str, halted, trapped, trace_tokens).
     """
     mem = bytearray(MEMORY_BYTES)
@@ -156,9 +158,11 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
     if input_base is None and program and program[0][0] == "input_base":
         input_base = program[0][1]
 
-    if input_base is not None and input_str:
-        for i, ch in enumerate(input_str.encode("utf-8") + b"\x00"):
-            mem[input_base + i] = ch
+    if isinstance(input_bytes, str):
+        input_bytes = input_bytes.encode("utf-8")
+    input_data = len(input_bytes).to_bytes(4, "little") + input_bytes + b"\x00"
+    if input_base is not None:
+        mem[input_base : input_base + len(input_data)] = input_data
 
     stack = []
     locals_ = [0] * 256
@@ -186,10 +190,9 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
                 break
 
         if op == "input_base":
-            input_bytes = input_str.encode("utf-8") + b"\x00" if input_str else b"\x00"
-            token_count += len(input_bytes) + 1
+            token_count += len(input_data) + 1
             if trace:
-                for ch_byte in input_bytes:
+                for ch_byte in input_data:
                     if 0x20 < ch_byte < 0x7F:
                         trace_tokens.append(chr(ch_byte))
                     else:
@@ -644,7 +647,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
 
         elif op == "output":
             val = stack.pop() & 0xFF
-            output.append(chr(val))
+            output.append(val)
             token_count += 1
             if trace:
                 trace_tokens.append(_out_token(val))
@@ -653,7 +656,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
         else:
             raise RuntimeError(f"Unknown op: {op} at pc={pc}")
 
-    result = (instr_count, token_count, "".join(output), halted, trapped)
+    result = (instr_count, token_count, bytes(output), halted, trapped)
     if trace:
         return result + (trace_tokens,)
     return result
@@ -729,7 +732,7 @@ def generate_ref(prog_path, ref_path=None, max_tokens=100_000_000):
     formatted = format_trace(prog_path, trace_tokens)
     with open(ref_path, "w") as f:
         f.write(formatted)
-    logger.info("%s: %d tokens, output=%r", ref_path, token_count, output)
+    logger.info("%s: %d tokens, output_hex=%s", ref_path, token_count, output.hex())
 
 
 def generate_all(regen=False):
@@ -769,14 +772,30 @@ def main():
     parser.add_argument(
         "--regen", action="store_true", help="Regenerate even if _ref.txt already exists"
     )
+    parser.add_argument(
+        "--output-hex",
+        action="store_true",
+        help="Print binary program output as lowercase hexadecimal instead of writing a trace",
+    )
     args = parser.parse_args()
 
     if not args.files:
+        if args.output_hex:
+            parser.error("--output-hex requires one or more program files")
         generate_all(regen=args.regen)
         return
 
     for prog_path in args.files:
-        generate_ref(prog_path)
+        if args.output_hex:
+            program, input_bytes = load_program(prog_path)
+            _instrs, _tokens, output, halted, trapped = run(program, input_bytes)
+            if trapped:
+                raise RuntimeError(f"{prog_path}: execution trapped")
+            if not halted:
+                raise RuntimeError(f"{prog_path}: execution did not emit halt")
+            print(output.hex())
+        else:
+            generate_ref(prog_path)
 
 
 if __name__ == "__main__":
