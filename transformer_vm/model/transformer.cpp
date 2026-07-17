@@ -271,17 +271,18 @@ static inline double secs(TP a, TP b) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s model.bin [--dense] [--regen] [--trace[=N]] [--brute|--nohull] [--args=STR] prog1.txt [...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s model.bin [--dense] [--regen] [--output-hex] [--trace[=N]] [--brute|--nohull] [--args=STR] prog1.txt [...]\n", argv[0]);
         return 1;
     }
 
-    bool regen = false, brute = false, dense = false;
+    bool regen = false, brute = false, dense = false, output_hex = false;
     int trace_every = 0;
     const char* trace_file = nullptr;
     const char* args_str = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--regen") == 0) regen = true;
         if (strcmp(argv[i], "--dense") == 0) dense = true;
+        if (strcmp(argv[i], "--output-hex") == 0) output_hex = true;
         if (strcmp(argv[i], "--brute") == 0 || strcmp(argv[i], "--nohull") == 0) brute = true;
         if (strncmp(argv[i], "--trace", 7) == 0) {
             trace_every = 1;
@@ -589,9 +590,13 @@ int main(int argc, char** argv) {
                 skipped++;
             }
             if (!output_bytes.empty()) {
-                printf("  output_hex: ");
-                for (unsigned char c : output_bytes)
-                    printf("%02x", c);
+                printf("  %s: ", output_hex ? "output_hex" : "output");
+                for (unsigned char c : output_bytes) {
+                    if (output_hex)
+                        printf("%02x", c);
+                    else
+                        putchar((c >= 0x20 && c < 0x7f) || c == '\n' || c == '\t' ? c : '.');
+                }
                 putchar('\n');
             }
         }

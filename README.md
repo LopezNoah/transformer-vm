@@ -71,8 +71,10 @@ The VM writes `uint32_le(payload_length) || payload || 0x00` at the input
 allocation. `compute` receives a pointer to `payload`; use
 `tvm_input_length(input)` from `runtime.h` rather than a string operation when
 processing binary data. The final NUL is a compatibility sentinel and is not
-part of the payload. `putchar()` emits raw bytes. `wasm-reference --output-hex`
-and `wasm-run` report output as lowercase, two-characters-per-byte hexadecimal.
+part of the payload. `putchar()` emits raw bytes. `wasm-run` displays printable
+output by default, replacing non-printable bytes with periods. Pass
+`--output-hex` to either `wasm-reference` or `wasm-run` for lowercase,
+two-characters-per-byte hexadecimal output.
 
 For crypto workloads, supply keys, nonces, messages, associated data, and
 ciphertexts as their literal byte sequences, normally with `--input-hex` or

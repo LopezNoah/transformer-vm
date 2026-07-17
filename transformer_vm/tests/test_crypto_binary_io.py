@@ -1,7 +1,7 @@
 """CRYPTO-002 binary input framing and deterministic output coverage."""
 
 from transformer_vm.compilation.compile_wasm import format_input_section, format_spec_input
-from transformer_vm.runner import _output_hex
+from transformer_vm.runner import _output_hex, _output_text
 from transformer_vm.wasm.reference import _extract_input, run
 
 
@@ -43,4 +43,5 @@ def test_reference_output_is_bytes_and_has_deterministic_hex():
     assert output == b"\x00\x80\xff"
     assert output.hex() == "0080ff"
     assert _output_hex(["out(00)", "out(80)", "out(ff)"]) == "0080ff"
+    assert _output_text(["out(H)", "out(i)", "out(0a)", "out(80)"]) == "Hi\n."
     assert halted and not trapped

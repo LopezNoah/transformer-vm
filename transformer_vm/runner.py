@@ -20,12 +20,25 @@ logger = logging.getLogger(__name__)
 
 def _output_hex(tokens):
     """Return emitted output tokens as lowercase hexadecimal bytes."""
+    return _output_bytes(tokens).hex()
+
+
+def _output_bytes(tokens):
+    """Return the bytes represented by emitted output tokens."""
     output = []
     for token in tokens:
         if token.startswith("out(") and token.endswith(")"):
             value = token[4:-1]
             output.append(ord(value) if len(value) == 1 else int(value, 16))
-    return bytes(output).hex()
+    return bytes(output)
+
+
+def _output_text(tokens):
+    """Return readable output, replacing non-printable bytes with periods."""
+    return "".join(
+        chr(value) if 0x20 <= value < 0x7F or value in (0x09, 0x0A) else "."
+        for value in _output_bytes(tokens)
+    )
 
 
 # ── Python model inference ────────────────────────────────────────
@@ -39,6 +52,7 @@ def run_model_program(
     ref_file=None,
     max_new_tokens=2000,
     verbose=False,
+    output_hex=False,
     cache_class=None,
 ):
     """Run a program through a saved transformer model.
@@ -64,9 +78,9 @@ def run_model_program(
 
     if verbose:
         logger.info("  Tokens: %s", " ".join(predicted))
-    output_hex = _output_hex(predicted)
-    if output_hex:
-        logger.info("  output_hex: %s", output_hex)
+    output = _output_hex(predicted) if output_hex else _output_text(predicted)
+    if output:
+        logger.info("  %s: %s", "output_hex" if output_hex else "output", output)
 
     if ref_file and os.path.exists(ref_file):
         with open(ref_file) as f:
@@ -139,7 +153,7 @@ def _build_cpp_engine():
         return None
 
 
-def run_cpp_engine(binary, model_path, files, brute=False, dense=False):
+def run_cpp_engine(binary, model_path, files, brute=False, dense=False, output_hex=False):
     """Run programs through the C++ inference engine.
 
     Returns True if all programs with refs passed.
@@ -149,6 +163,8 @@ def run_cpp_engine(binary, model_path, files, brute=False, dense=False):
         cmd.append("--brute")
     if dense:
         cmd.append("--dense")
+    if output_hex:
+        cmd.append("--output-hex")
     cmd += files
     result = subprocess.run(cmd)
     return result.returncode == 0
@@ -237,6 +253,11 @@ def main():
         help="Materialize dense C++ projections for sparse-performance comparisons",
     )
     parser.add_argument(
+        "--output-hex",
+        action="store_true",
+        help="Print program output as lowercase hexadecimal",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Print the full generated token sequence"
     )
     parser.add_argument(
@@ -292,7 +313,14 @@ def main():
             logger.info(
                 "[engine] Running %d %s program(s) via C++ engine", len(profile_files), profile
             )
-            if not run_cpp_engine(binary, model_path, profile_files, brute=args.nohull, dense=args.dense):
+            if not run_cpp_engine(
+                binary,
+                model_path,
+                profile_files,
+                brute=args.nohull,
+                dense=args.dense,
+                output_hex=args.output_hex,
+            ):
                 raise SystemExit(1)
         return
 
@@ -335,6 +363,7 @@ def main():
             ref_file if has_ref else None,
             max_new_tokens=args.max_new_tokens,
             verbose=args.verbose,
+            output_hex=args.output_hex,
             cache_class=cache_class,
         )
         dt = time.time() - t0
