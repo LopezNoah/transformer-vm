@@ -60,7 +60,45 @@ CRYPTO-001 command: `uv run wasm-build --save-weights=model.bin`.
 | Saved weight size | 1,194,466 bytes | 64,882,935 bytes | 54.32x |
 
 The reported times are HiGHS MILP solve times, not total wall-clock build
-times. Both runs reached their optimal objective.
+times. Both runs reached their optimal objective. These results predate the
+formulation improvements below and are retained as the historical CRYPTO-001
+comparison.
+
+## MILP Formulation Optimization
+
+The scheduler was optimized by computing ASAP/ALAP phase bounds, restricting
+time-indexed binaries to feasible layer windows, replacing global big-M values
+with expression-specific bounds, enforcing `death[d]` as the exact last
+consumer phase, transitively reducing dependency and consumer constraints, and
+omitting unused final-boundary alive indicators. HiGHS presolve and symmetry
+detection are enabled, while the time limit, thread count, and relative MIP gap
+are configurable.
+
+The optimized full capability profile was benchmarked with 10 layers and 12
+HiGHS worker threads and compared with the historical result above. Both
+formulations reached the same optimal `d_model=340` objective.
+
+| Metric | Previous formulation | Optimized formulation | Change |
+| --- | ---: | ---: | ---: |
+| MILP rows | 166,610 | 34,042 | 79.6% fewer |
+| MILP columns | 65,771 | 14,264 | 78.3% fewer |
+| MILP nonzeros | 401,155 | 84,430 | 79.0% fewer |
+| MILP solve time | 181.37 s | 66.27 s | 2.74x faster |
+| MILP nodes | 2,577 | 1,905 | 26.1% fewer |
+| LP iterations | 426,748 | 178,004 | 58.3% fewer |
+| `d_model` | 340 | 340 | Unchanged |
+
+The optimized base profile contained 2,847 columns and 6,613 rows and solved
+to `d_model=38` in 1.97 seconds with one branch-and-bound node.
+
+The optimized full-profile plan reproduced the complete 1,034-token `hello`
+reference trace. The non-slow test suite also passed all 91 selected tests.
+
+Run the scheduler with the same thread count using:
+
+```bash
+uv run python -m transformer_vm.scheduler.milp --threads 12
+```
 
 ## Universal Model Execution Comparison
 

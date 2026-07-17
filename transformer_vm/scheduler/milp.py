@@ -15,6 +15,7 @@ Minimizes d_model = 2 * D_half where D_half >= max over all boundaries of:
 import argparse  # noqa: I001
 import heapq
 import logging
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -151,6 +152,69 @@ def _min_layers(ops, op_deps):
     return max(phase.values()) // 4 + 1
 
 
+def _allowed_phases(op, n_layers):
+    if isinstance(op, LookUp):
+        return range(0, 4 * n_layers, 4)
+    if isinstance(op, ReGLUDimension):
+        return range(2, 4 * n_layers, 4)
+    return range(1, 4 * n_layers, 2)
+
+
+def _schedule_bounds(ops, op_deps, n_layers):
+    """Return safe ASAP/ALAP phase bounds and a topological ordering."""
+    remaining = set(ops)
+    earliest = {}
+    topo = []
+    while remaining:
+        ready = [op for op in remaining if all(dep in earliest for dep in op_deps.get(op, set()))]
+        if not ready:
+            raise ValueError("Cycle in dependencies")
+        for op in ready:
+            required = max((earliest[d] + 1 for d in op_deps.get(op, set())), default=0)
+            phase = next((p for p in _allowed_phases(op, n_layers) if p >= required), None)
+            if phase is None:
+                raise ValueError(f"No feasible phase for {op}; try more layers")
+            earliest[op] = phase
+            topo.append(op)
+            remaining.remove(op)
+
+    children = defaultdict(set)
+    for op, deps in op_deps.items():
+        for dep in deps:
+            children[dep].add(op)
+
+    latest = {}
+    for op in reversed(topo):
+        required = min((latest[c] - 1 for c in children.get(op, set())), default=4 * n_layers - 1)
+        phase = next((p for p in reversed(_allowed_phases(op, n_layers)) if p <= required), None)
+        if phase is None or phase < earliest[op]:
+            raise ValueError(f"No feasible phase for {op}; try more layers")
+        latest[op] = phase
+    return earliest, latest, topo
+
+
+def _dependency_closure(topo, op_deps):
+    """Return descendants and a transitively reduced dependency relation."""
+    children = defaultdict(set)
+    for op, deps in op_deps.items():
+        for dep in deps:
+            children[dep].add(op)
+    descendants = {op: set() for op in topo}
+    for op in reversed(topo):
+        for child in children.get(op, set()):
+            descendants[op].add(child)
+            descendants[op].update(descendants[child])
+    reduced = {}
+    for op in topo:
+        deps = op_deps.get(op, set())
+        reduced[op] = {
+            dep
+            for dep in deps
+            if not any(other != dep and other in descendants[dep] for other in deps)
+        }
+    return descendants, reduced
+
+
 def _all_result_dims(graph):
     """All dimensions in the graph (inputs + produced)."""
     dims = list(graph["inputs"])
@@ -164,7 +228,15 @@ def _all_result_dims(graph):
 
 
 def milp_schedule(
-    input_tokens, output_tokens, max_layers=None, max_ffn=None, log=None, program_graph=None
+    input_tokens,
+    output_tokens,
+    max_layers=None,
+    max_ffn=None,
+    log=None,
+    program_graph=None,
+    time_limit=3600,
+    solver_threads=None,
+    gap_rel=None,
 ):
     """Optimal schedule minimizing dependency width at persist boundaries.
 
@@ -174,6 +246,9 @@ def milp_schedule(
         log: logging callable (defaults to logger.info).
         program_graph: optional ProgramGraph; if provided, uses its dims/lookups
             and positional dimensions instead of module-level globals.
+        time_limit: solver time limit in seconds.
+        solver_threads: number of HiGHS worker threads (defaults to solver choice).
+        gap_rel: optional relative MIP gap for accepting a near-optimal schedule.
     """
     _log = log or print
 
@@ -204,6 +279,8 @@ def milp_schedule(
 
     N = max_layers or _min_layers(ops, od)
     P = 4 * N
+    phase_lb, phase_ub, topo = _schedule_bounds(ops, od, N)
+    descendants, reduced_od = _dependency_closure(topo, od)
     _log(f"MILP: {len(ops)} ops, {len(all_dims)} dims, {N} layers, {P} phases")
 
     # ── MILP ──────────────────────────────────────────────────────
@@ -211,7 +288,10 @@ def milp_schedule(
     D_half = LpVariable("D_half", 0, cat="Integer")
     prob += D_half
 
-    k = {op: LpVariable(f"k_{i}", 0, N - 1, LpInteger) for i, op in enumerate(ops)}
+    k = {
+        op: LpVariable(f"k_{i}", phase_lb[op] // 4, phase_ub[op] // 4, LpInteger)
+        for i, op in enumerate(ops)
+    }
     z = {
         op: LpVariable(f"z_{i}", 0, 1, LpBinary)
         for i, op in enumerate(ops)
@@ -226,7 +306,9 @@ def milp_schedule(
         return 4 * k[op] + 1 + 2 * z[op]
 
     for op in ops:
-        for dep in od.get(op, set()):
+        prob += phase_of(op) >= phase_lb[op]
+        prob += phase_of(op) <= phase_ub[op]
+        for dep in reduced_od.get(op, set()):
             if dep in k:
                 prob += phase_of(op) >= phase_of(dep) + 1
 
@@ -235,25 +317,35 @@ def milp_schedule(
             if lu in k and op in k:
                 prob += k[op] == k[lu]
 
-    # death[d] = max phase of any consumer (LP variable)
+    protected_dims = {pos, ilp, psq}
+
+    # death[d] is exactly the last consumer phase. Consumers that precede
+    # another consumer cannot attain the maximum and are omitted.
     death = {}
+    death_lb = {}
+    death_ub = {}
     for d in all_dims:
-        if d in output_dims:
+        if d in output_dims or d in protected_dims:
             continue
         cons = [c_op for c_op in consumers.get(d, set()) if c_op in k]
-        if not cons and d is not pos:
+        cons = [c for c in cons if not any(o != c and o in descendants[c] for o in cons)]
+        if not cons:
             continue
-        dv = LpVariable(f"d_{id(d)}", 0, P - 1, LpInteger)
+        dlb = max(phase_lb[c] for c in cons)
+        dub = max(phase_ub[c] for c in cons)
+        dv = LpVariable(f"d_{id(d)}", dlb, dub, LpInteger)
         for c_op in cons:
             prob += dv >= phase_of(c_op)
+        if len(cons) == 1:
+            prob += dv <= phase_of(cons[0])
+        else:
+            last = [LpVariable(f"dm_{id(d)}_{i}", 0, 1, LpBinary) for i in range(len(cons))]
+            prob += lpSum(last) == 1
+            for selected, c_op in zip(last, cons, strict=True):
+                prob += dv <= phase_of(c_op) + (dub - phase_lb[c_op]) * (1 - selected)
         death[d] = dv
-
-    # Position must survive until any persist1 phase (for passthrough keys).
-    # persist2 uses FFN passthrough (no hull key), so no position needed.
-    if pos in death:
-        for op in ops:
-            if isinstance(op, PersistDimension) and op in z:
-                prob += death[pos] >= phase_of(op) - P * z[op]
+        death_lb[d] = dlb
+        death_ub[d] = dub
 
     # ── FFN width limit: at most max_ffn ReGLUs per layer ─────────
     if max_ffn is not None:
@@ -261,12 +353,13 @@ def milp_schedule(
         n_reg = len(reglus_list)
         fb = {}
         for i, rg in enumerate(reglus_list):
-            for L in range(N):
+            layers = range(phase_lb[rg] // 4, phase_ub[rg] // 4 + 1)
+            for L in layers:
                 fb[i, L] = LpVariable(f"fb_{i}_{L}", 0, 1, LpBinary)
-            prob += lpSum(fb[i, L] for L in range(N)) == 1
-            prob += k[rg] == lpSum(L * fb[i, L] for L in range(N))
+            prob += lpSum(fb[i, L] for L in layers) == 1
+            prob += k[rg] == lpSum(L * fb[i, L] for L in layers)
         for L in range(N):
-            prob += lpSum(fb[i, L] for i in range(n_reg)) <= max_ffn
+            prob += lpSum(fb[i, L] for i in range(n_reg) if (i, L) in fb) <= max_ffn
 
     di = {d: i for i, d in enumerate(all_dims)}
     lookups = graph["lookups"]
@@ -276,20 +369,22 @@ def milp_schedule(
     # ── Layer indicators for lookups ─────────────────────────────
     lu_at = {}
     for lu in lookups:
-        for L in range(N):
+        layers = range(phase_lb[lu] // 4, phase_ub[lu] // 4 + 1)
+        for L in layers:
             lu_at[lu, L] = LpVariable(f"la_{id(lu)}_{L}", 0, 1, LpBinary)
-        prob += lpSum(lu_at[lu, L] for L in range(N)) == 1
-        prob += k[lu] == lpSum(L * lu_at[lu, L] for L in range(N))
+        prob += lpSum(lu_at[lu, L] for L in layers) == 1
+        prob += k[lu] == lpSum(L * lu_at[lu, L] for L in layers)
 
     # ── Layer indicators for persists (persist1 vs persist2) ─────
     p_layer = {}
     p1_at = {}
     for p in persists:
-        for L in range(N):
+        layers = range(phase_lb[p] // 4, phase_ub[p] // 4 + 1)
+        for L in layers:
             p_layer[p, L] = LpVariable(f"pl_{id(p)}_{L}", 0, 1, LpBinary)
-        prob += lpSum(p_layer[p, L] for L in range(N)) == 1
-        prob += k[p] == lpSum(L * p_layer[p, L] for L in range(N))
-        for L in range(N):
+        prob += lpSum(p_layer[p, L] for L in layers) == 1
+        prob += k[p] == lpSum(L * p_layer[p, L] for L in layers)
+        for L in layers:
             p1v = LpVariable(f"p1_{id(p)}_{L}", 0, 1, LpBinary)
             prob += p1v <= p_layer[p, L]
             prob += p1v <= 1 - z[p]
@@ -307,21 +402,55 @@ def milp_schedule(
     pd_var = {}
     for d, p_set in P1_deps.items():
         lu_of_d = dim_to_op.get(d) if isinstance(d, LookUpDimension) else None
-        for L in range(N):
+        feasible_layers = sorted(
+            {L for p in p_set for L in range(phase_lb[p] // 4, phase_ub[p] // 4 + 1)}
+        )
+        for L in feasible_layers:
+            p1_here = [p1_at[p, L] for p in p_set if (p, L) in p1_at]
+            if not p1_here:
+                continue
             v = LpVariable(f"pd_{id(d)}_{L}", 0, 1, LpBinary)
-            prob += v <= lpSum(p1_at[p, L] for p in p_set)
-            if lu_of_d is not None and lu_of_d in lu_at:
-                prob += v <= 1 - lu_at[lu_of_d, L]
+            prob += v <= lpSum(p1_here)
+            if lu_of_d is not None:
+                lu_here = lu_at.get((lu_of_d, L), 0)
+                prob += v <= 1 - lu_here
                 for p in p_set:
-                    prob += v >= p1_at[p, L] - lu_at[lu_of_d, L]
+                    if (p, L) in p1_at:
+                        prob += v >= p1_at[p, L] - lu_here
             else:
                 for p in p_set:
-                    prob += v >= p1_at[p, L]
+                    if (p, L) in p1_at:
+                        prob += v >= p1_at[p, L]
             pd_var[d, L] = v
 
     # ── Lookup heads and dims ───────────────────────────────────
     lu_h = {lu: (len(lu.value_exprs) + 1) // 2 for lu in lookups}
     lu_d = {lu: len(lu.dims) for lu in lookups}
+
+    def ge_indicator(name, expr, lower, upper, threshold):
+        """Binary indicator for expr >= threshold using expression-specific M values."""
+        if lower >= threshold:
+            return 1
+        if upper < threshold:
+            return 0
+        indicator = LpVariable(name, 0, 1, LpBinary)
+        prob.addConstraint(expr >= threshold - (threshold - lower) * (1 - indicator))
+        prob.addConstraint(expr <= threshold - 1 + (upper - threshold + 1) * indicator)
+        return indicator
+
+    def and_indicator(name, terms):
+        if any(isinstance(term, (int, float)) and term == 0 for term in terms):
+            return 0
+        terms = [term for term in terms if not isinstance(term, (int, float))]
+        if not terms:
+            return 1
+        if len(terms) == 1:
+            return terms[0]
+        indicator = LpVariable(name, 0, 1, LpBinary)
+        for term in terms:
+            prob.addConstraint(indicator <= term)
+        prob.addConstraint(indicator >= lpSum(terms) - len(terms) + 1)
+        return indicator
 
     # ── needs_slot indicator for lookup/reglu dims ─────────────
     # A lookup dim at phase 4L needs a slot only if death >= 4L+2
@@ -338,9 +467,9 @@ def milp_schedule(
         if prod is None or prod not in k:
             continue
         if isinstance(d, (LookUpDimension, ReGLUDimension)):
-            ns_v = LpVariable(f"ns_{di[d]}", 0, 1, LpBinary)
-            prob += death[d] >= phase_of(prod) + 2 - P * (1 - ns_v)
-            prob += death[d] <= phase_of(prod) + 1 + P * ns_v
+            diff_lb = death_lb[d] - phase_ub[prod]
+            diff_ub = death_ub[d] - phase_lb[prod]
+            ns_v = ge_indicator(f"ns_{di[d]}", death[d] - phase_of(prod), diff_lb, diff_ub, 2)
             ns[d] = ns_v
 
     # ── Occupied slot count at each boundary (death >= c-1) ──────
@@ -354,7 +483,6 @@ def milp_schedule(
     #
     # Positional dims always occupy their fixed slots because
     # the embedding writes to them.
-    protected_dims = {pos, ilp, psq}
     alive_sum = {}
     n_inputs = sum(1 for d in all_dims if isinstance(d, InputDimension))
 
@@ -363,6 +491,7 @@ def milp_schedule(
             continue
         ew = []
         alive = []
+        need_alive = c != P - 1
         for d in all_dims:
             prod = dim_to_op.get(d)
             is_input = isinstance(d, InputDimension)
@@ -370,56 +499,48 @@ def milp_schedule(
             if d in output_dims or d in protected_dims:
                 if is_input:
                     ew.append(1)
-                    alive.append(1)
+                    if need_alive:
+                        alive.append(1)
                 elif prod in k:
-                    bb = LpVariable(f"b_{di[d]}_{c}", 0, 1, LpBinary)
-                    prob += phase_of(prod) <= c + P * (1 - bb)
-                    prob += phase_of(prod) >= (c + 1) - P * bb
+                    bb = ge_indicator(
+                        f"b_{di[d]}_{c}",
+                        -phase_of(prod),
+                        -phase_ub[prod],
+                        -phase_lb[prod],
+                        -c,
+                    )
                     ew.append(bb)
-                    alive.append(bb)
+                    if need_alive:
+                        alive.append(bb)
                 continue
 
             if d not in death:
                 continue
 
             if is_input:
-                eu = LpVariable(f"ew_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += death[d] >= (c - 1) - P * (1 - eu)
-                prob += death[d] <= (c - 2) + P * eu
+                eu = ge_indicator(f"ew_{di[d]}_{c}", death[d], death_lb[d], death_ub[d], c - 1)
                 ew.append(eu)
-                au = LpVariable(f"a_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += death[d] >= (c + 1) - P * (1 - au)
-                prob += death[d] <= c + P * au
-                alive.append(au)
+                if need_alive:
+                    au = ge_indicator(f"a_{di[d]}_{c}", death[d], death_lb[d], death_ub[d], c + 1)
+                    alive.append(au)
             elif prod in k:
-                bb = LpVariable(f"b_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += phase_of(prod) <= c + P * (1 - bb)
-                prob += phase_of(prod) >= (c + 1) - P * bb
-                eu = LpVariable(f"eu_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += death[d] >= (c - 1) - P * (1 - eu)
-                prob += death[d] <= (c - 2) + P * eu
-                ev = LpVariable(f"ew_{di[d]}_{c}", 0, 1, LpBinary)
-                if d in ns:
-                    prob += ev <= bb
-                    prob += ev <= eu
-                    prob += ev <= ns[d]
-                    prob += ev >= bb + eu + ns[d] - 2
-                else:
-                    prob += ev <= bb
-                    prob += ev <= eu
-                    prob += ev >= bb + eu - 1
+                bb = ge_indicator(
+                    f"b_{di[d]}_{c}",
+                    -phase_of(prod),
+                    -phase_ub[prod],
+                    -phase_lb[prod],
+                    -c,
+                )
+                eu = ge_indicator(f"eu_{di[d]}_{c}", death[d], death_lb[d], death_ub[d], c - 1)
+                ev = and_indicator(f"ew_{di[d]}_{c}", [bb, eu, ns[d]] if d in ns else [bb, eu])
                 ew.append(ev)
-                au = LpVariable(f"au_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += death[d] >= (c + 1) - P * (1 - au)
-                prob += death[d] <= c + P * au
-                av = LpVariable(f"a_{di[d]}_{c}", 0, 1, LpBinary)
-                prob += av <= bb
-                prob += av <= au
-                prob += av >= bb + au - 1
-                alive.append(av)
+                if need_alive:
+                    au = ge_indicator(f"au_{di[d]}_{c}", death[d], death_lb[d], death_ub[d], c + 1)
+                    alive.append(and_indicator(f"a_{di[d]}_{c}", [bb, au]))
 
         prob += 2 * D_half >= lpSum(ew)
-        alive_sum[c] = lpSum(alive)
+        if need_alive:
+            alive_sum[c] = lpSum(alive)
 
     # ── Head count constraint at each layer ──────────────────────
     # heads_L = n_lu + ceil((dying + passthrough) / 2)
@@ -428,11 +549,11 @@ def milp_schedule(
         c_attn = 4 * L + 1
         c_prev = 4 * L - 1
 
-        n_lu_L = lpSum(lu_h[lu] * lu_at[lu, L] for lu in lookups)
+        n_lu_L = lpSum(lu_h[lu] * lu_at[lu, L] for lu in lookups if (lu, L) in lu_at)
         pt_L = lpSum(pd_var[d, L] for d in P1_deps if (d, L) in pd_var)
 
-        born_L = lpSum(lu_d[lu] * lu_at[lu, L] for lu in lookups) + lpSum(
-            p1_at[p, L] for p in persists
+        born_L = lpSum(lu_d[lu] * lu_at[lu, L] for lu in lookups if (lu, L) in lu_at) + lpSum(
+            p1_at[p, L] for p in persists if (p, L) in p1_at
         )
         prev_alive = alive_sum.get(c_prev, n_inputs)
         cur_alive = alive_sum[c_attn]
@@ -441,23 +562,64 @@ def milp_schedule(
         prob += 2 * D_half >= 2 * n_lu_L + dying_L + pt_L
 
     # ── Solve ─────────────────────────────────────────────────────
+    _log(f"MILP model: {len(prob.variables())} columns, {len(prob.constraints)} rows")
     _log("Solving MILP...")
+    solve_start = time.perf_counter()
+    highs = False
     try:
         from pulp import HiGHS
 
-        solver = HiGHS(timeLimit=3600)
+        options = {"presolve": "on", "mip_detect_symmetry": True}
+        solver = HiGHS(
+            timeLimit=time_limit,
+            threads=solver_threads,
+            gapRel=gap_rel,
+            **options,
+        )
+        highs = True
     except Exception:
         from pulp import PULP_CBC_CMD
 
-        solver = PULP_CBC_CMD(msg=0, timeLimit=3600)
+        solver = PULP_CBC_CMD(msg=0, timeLimit=time_limit, threads=solver_threads, gapRel=gap_rel)
     prob.solve(solver)
+    wall_time = time.perf_counter() - solve_start
 
-    if prob.status != 1:
-        raise RuntimeError(f"MILP infeasible (status={prob.status}); try more layers")
+    termination = "unknown"
+    is_optimal = prob.status == 1 and prob.sol_status == 1
+    solver_stats = {}
+    if highs:
+        model = prob.solverModel
+        info = model.getInfo()
+        termination = model.modelStatusToString(model.getModelStatus())
+        solver_stats = dict(
+            nodes=info.mip_node_count,
+            lp_iterations=info.simplex_iteration_count,
+            incumbent=info.objective_function_value,
+            bound=info.mip_dual_bound,
+            gap=info.mip_gap,
+        )
+        _log(
+            f"MILP solver: termination={termination}, wall={wall_time:.3f}s, "
+            f"nodes={solver_stats['nodes']}, lp_iterations={solver_stats['lp_iterations']}, "
+            f"incumbent={solver_stats['incumbent']:g}, bound={solver_stats['bound']:g}, "
+            f"gap={solver_stats['gap']:g}"
+        )
+    else:
+        _log(
+            f"MILP solver: termination={termination}, wall={wall_time:.3f}s, "
+            f"status={prob.status}, solution_status={prob.sol_status}"
+        )
+
+    if prob.sol_status not in (1, 2):
+        raise RuntimeError(
+            f"MILP produced no feasible schedule (termination={termination}, status={prob.status}); "
+            "try more layers"
+        )
 
     opt_D_half = int(round(value(D_half)))
     opt_D = 2 * opt_D_half
-    _log(f"MILP optimal d_model: {opt_D}")
+    result_kind = "optimal" if is_optimal else "incumbent"
+    _log(f"MILP {result_kind} d_model: {opt_D}")
 
     # ── Extract assignment & build layers ──────────────────────────
     pa = {}
@@ -684,6 +846,12 @@ def milp_schedule(
         alive_after=alive_after,
         lin_widths=lin_widths,
         width=opt_D,
+        solver=dict(
+            termination=termination,
+            optimal=is_optimal,
+            wall_time=wall_time,
+            **solver_stats,
+        ),
     )
 
 
@@ -801,13 +969,26 @@ def main():
     parser = argparse.ArgumentParser(description="Run MILP scheduler for the WASM interpreter.")
     parser.add_argument("--max-layers", type=int, default=None, help="Max transformer layers")
     parser.add_argument("--max-ffn", type=int, default=None, help="Max FFN neurons per layer")
+    parser.add_argument(
+        "--time-limit", type=float, default=3600, help="Solver time limit in seconds"
+    )
+    parser.add_argument("--threads", type=int, default=None, help="HiGHS worker threads")
+    parser.add_argument("--gap-rel", type=float, default=None, help="Accepted relative MIP gap")
     args = parser.parse_args()
 
     from transformer_vm.wasm.interpreter import build
 
     input_tokens, output_tokens = build()
 
-    milp_schedule(input_tokens, output_tokens, max_layers=args.max_layers, max_ffn=args.max_ffn)
+    milp_schedule(
+        input_tokens,
+        output_tokens,
+        max_layers=args.max_layers,
+        max_ffn=args.max_ffn,
+        time_limit=args.time_limit,
+        solver_threads=args.threads,
+        gap_rel=args.gap_rel,
+    )
 
 
 if __name__ == "__main__":
