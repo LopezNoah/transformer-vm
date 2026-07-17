@@ -166,6 +166,7 @@ def build_model(
             tok_to_idx_map,
             vocab_size,
             input_dims,
+            lookups_by_name,
         ) = _shared
     else:
         if program_graph is not None:
@@ -177,6 +178,7 @@ def build_model(
             _position = pg.position
             _inv_log_pos = pg.inv_log_pos
             _position_sq = pg.position_sq
+
         else:
             from transformer_vm.wasm.interpreter import WASMMachine
 
@@ -189,6 +191,8 @@ def build_model(
             _position = pg.position
             _inv_log_pos = pg.inv_log_pos
             _position_sq = pg.position_sq
+
+        lookups_by_name = {lookup.name or f"lookup_{lookup.id}": lookup for lookup in pg.all_lookups}
 
         # ── Load schedule ─────────────────────────────────────────
         if plan_path:
@@ -571,6 +575,19 @@ def build_model(
     model.attn_erase = [sorted(erased_at[(li, 1)]) for li in range(n_layers)]
     model.ffn_erase = [sorted(erased_at[(li, 3)]) for li in range(n_layers)]
     model.head_tiebreak = all_tiebreak
+    model.head_type = []
+    for li in range(n_layers):
+        types = [0] * n_heads
+        for h, info in head_map[li].items():
+            if info["type"] == "passthrough":
+                types[h] = 1
+            elif info["type"] == "lookup":
+                lookup = lookups_by_name.get(info["lookup"])
+                if lookup and len(lookup.key_exprs_2d[0].terms) == 1:
+                    dim, coeff = next(iter(lookup.key_exprs_2d[0].terms.items()))
+                    if isinstance(dim, InputDimension) and dim.name == "position" and coeff == 2:
+                        types[h] = 2
+        model.head_type.append(types)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(
@@ -620,6 +637,7 @@ def build_model(
         tok_to_idx_map,
         vocab_size,
         input_dims,
+        lookups_by_name,
     )
 
     return model, all_tokens, tok_to_idx_map, shared
@@ -735,6 +753,14 @@ def save_weights(model, all_tokens, path):
             for li in range(n_layers):
                 for h in range(H):
                     f.write(struct.pack("<i", model.head_tiebreak[li][h]))
+
+        has_head_type = hasattr(model, "head_type")
+        f.write(struct.pack("<i", 1 if has_head_type else 0))
+        if has_head_type:
+            H = model.attn[0].num_heads
+            for li in range(n_layers):
+                for h in range(H):
+                    f.write(struct.pack("<i", model.head_type[li][h]))
 
     logger.info("Saved weights to %s (%s bytes)", path, f"{os.path.getsize(path):,}")
 
@@ -873,6 +899,12 @@ def load_weights(path):
             for _ in range(n_layers):
                 layer_tb = [struct.unpack("<i", f.read(4))[0] for _ in range(n_heads)]
                 model.head_tiebreak.append(layer_tb)
+
+        remaining = f.read(4)
+        if len(remaining) == 4 and struct.unpack("<i", remaining)[0]:
+            model.head_type = [
+                [struct.unpack("<i", f.read(4))[0] for _ in range(n_heads)] for _ in range(n_layers)
+            ]
 
     logger.info(
         "Loaded weights from %s (vocab=%d, d_model=%d, n_layers=%d, n_heads=%d, d_ffn=%d)",

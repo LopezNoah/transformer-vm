@@ -87,6 +87,7 @@ struct Model {
     std::vector<std::vector<int>> attn_erase;
     std::vector<std::vector<int>> ffn_erase;
     std::vector<std::vector<TieBreak>> head_tb;
+    std::vector<std::vector<int>> head_type;
 };
 
 static void read_sparse(FILE* f, SparseMatrix& s) {
@@ -205,6 +206,13 @@ static void load(Model& m, const char* path) {
                 m.head_tb[l][h] = (v == 1) ? TieBreak::LATEST : TieBreak::AVERAGE;
             }
         }
+    }
+    int32_t has_ht = 0;
+    if (fread(&has_ht, 4, 1, f) == 1 && has_ht) {
+        m.head_type.resize(L, std::vector<int>(m.H));
+        for (int l = 0; l < L; l++)
+            for (int h = 0; h < m.H; h++)
+                fread(&m.head_type[l][h], 4, 1, f);
     }
     fclose(f);
 
@@ -358,6 +366,7 @@ int main(int argc, char** argv) {
 
         std::vector<HardAttentionHead> hulls(brute ? 0 : L * H);
         std::vector<BruteAttentionHead> brutes(brute ? L * H : 0);
+        std::vector<std::vector<double>> gather_values(L * H);
         int seq = 0;
 
         std::vector<double> x(D), qkv(3*D), ho(D), ao(D),
@@ -392,6 +401,22 @@ int main(int argc, char** argv) {
                 int base = l * H;
                 for (int h = 0; h < H; h++) {
                     if (!dense && !ly.active_heads[h]) { ho[h * 2] = ho[h * 2 + 1] = 0.0; continue; }
+                    int type = !m.head_type.empty() ? m.head_type[l][h] : 0;
+                    if (!brute && type == 1) {
+                        ho[h * 2] = v[h * 2];
+                        ho[h * 2 + 1] = v[h * 2 + 1];
+                        continue;
+                    }
+                    if (!brute && type == 2) {
+                        auto& values = gather_values[base + h];
+                        values.push_back(v[h * 2]);
+                        values.push_back(v[h * 2 + 1]);
+                        int idx = q[h * 2 + 1] == 0.0 ? 0 : (int)std::round(q[h * 2] / q[h * 2 + 1]);
+                        idx = std::max(0, std::min(idx, pos));
+                        ho[h * 2] = values[2 * idx];
+                        ho[h * 2 + 1] = values[2 * idx + 1];
+                        continue;
+                    }
                     TieBreak tb = (!m.head_tb.empty()) ? m.head_tb[l][h] : TieBreak::AVERAGE;
                     if (brute) {
                         brutes[base+h].insert(&k[h*2], &v[h*2], seq);
