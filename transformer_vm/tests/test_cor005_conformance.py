@@ -12,7 +12,11 @@ import torch
 
 from transformer_vm._paths import DATA_DIR
 from transformer_vm.attention import HullKVCache, StandardKVCache
-from transformer_vm.compilation.compile_wasm import compile_c_to_wasm, compile_wasm_to_prefix
+from transformer_vm.compilation.compile_wasm import (
+    compile_c_to_wasm,
+    compile_program,
+    compile_wasm_to_prefix,
+)
 from transformer_vm.model.weights import build_model, save_weights
 from transformer_vm.wasm.reference import load_program_from_string, run
 
@@ -259,3 +263,27 @@ def test_python_hull_inference_matches_cpp(universal_model, tmp_path):
     )
 
     assert _read_cpp_trace(trace_path) == python_tokens
+
+
+def test_sha256_digest_matches_standalone_cpp(universal_model, tmp_path):
+    model, all_tokens, _tok_to_idx_map = universal_model
+    source = tmp_path / "sha256.c"
+    shutil.copyfile("transformer_vm/examples/sha256.c", source)
+    program_base = tmp_path / "sha256"
+    compile_program(
+        str(source), input_bytes=b"abc", out_base=str(program_base), profile="full"
+    )
+
+    weights_path = tmp_path / "model.bin"
+    binary_path = tmp_path / "transformer"
+    save_weights(model, all_tokens, weights_path)
+    _compile_cpp(binary_path)
+    result = subprocess.run(
+        [str(binary_path), str(weights_path), str(program_base) + ".txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" in result.stdout
+    assert "peak cache:" in result.stdout

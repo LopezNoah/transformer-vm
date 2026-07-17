@@ -368,6 +368,7 @@ int main(int argc, char** argv) {
         std::vector<HardAttentionHead> hulls(brute ? 0 : L * H);
         std::vector<BruteAttentionHead> brutes(brute ? L * H : 0);
         std::vector<std::vector<double>> gather_values(L * H);
+        size_t cache_entries = 0;
         int seq = 0;
 
         std::vector<double> x(D), qkv(3*D), ho(D), ao(D),
@@ -412,6 +413,7 @@ int main(int argc, char** argv) {
                         auto& values = gather_values[base + h];
                         values.push_back(v[h * 2]);
                         values.push_back(v[h * 2 + 1]);
+                        cache_entries++;
                         int idx = q[h * 2 + 1] == 0.0 ? 0 : (int)std::round(q[h * 2] / q[h * 2 + 1]);
                         idx = std::max(0, std::min(idx, pos));
                         ho[h * 2] = values[2 * idx];
@@ -421,9 +423,11 @@ int main(int argc, char** argv) {
                     TieBreak tb = (!m.head_tb.empty()) ? m.head_tb[l][h] : TieBreak::AVERAGE;
                     if (brute) {
                         brutes[base+h].insert(&k[h*2], &v[h*2], seq);
+                        cache_entries++;
                         brutes[base+h].query(&q[h*2], tb, &ho[h*2]);
                     } else {
                         hulls[base+h].insert(&k[h*2], &v[h*2], seq);
+                        cache_entries++;
                         hulls[base+h].query(&q[h*2], tb, &ho[h*2]);
                     }
                 }
@@ -599,6 +603,7 @@ int main(int argc, char** argv) {
                 }
                 putchar('\n');
             }
+            printf("  peak cache: %zu logical head entries\n", cache_entries);
         }
     }
 

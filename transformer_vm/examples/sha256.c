@@ -1,8 +1,7 @@
 /*
  * Portable SHA-256 example for Transformer VM.
  *
- * Input is the binary-safe Transformer VM payload. The four bytes immediately
- * before `input` contain its little-endian length. Output is a lowercase
+ * Input is the binary-safe Transformer VM payload. Output is a lowercase
  * hexadecimal SHA-256 digest.
  */
 
@@ -74,7 +73,7 @@ static void print_hex_byte(unsigned int value) {
 
 void compute(const char *input) {
     const unsigned char *message = (const unsigned char *)input;
-    unsigned int length = ((const unsigned int *)input)[-1];
+    unsigned int length = tvm_input_length(message);
     unsigned int state[8] = {
         0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u

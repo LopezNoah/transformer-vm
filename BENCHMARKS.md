@@ -1,5 +1,31 @@
 # Transformer VM Benchmarks
 
+## CRYPTO-003 SHA-256
+
+The portable SHA-256 example was measured with the three-byte `abc` RFC 6234
+vector. The deterministic reference trace has 14,042 input-prefix tokens and
+83,751 generated tokens, or 97,793 total tokens (32,597.7 total tokens/input
+byte). Its exact lowercase digest is verified against Node/V8 and the reference
+interpreter; the transformer runtime produced the same digest.
+
+The standalone sparse C++ hull runtime completed the 97,793-token workload in
+4.62 seconds (21,169 tok/s, 0.65 input bytes/s). Peak cache occupancy was
+97,793 sequence positions and 9,485,824 logical head entries across active
+layers; the runtime reports the latter directly. This single run used an Apple
+M2 Pro with 16 GiB RAM on macOS/Darwin 25.3.0 and the full 10-layer,
+170-head model. Throughput is machine-dependent; token counts and peak logical
+occupancy are deterministic.
+
+Reproduce the vectors, deterministic trace metrics, and transformer run with:
+
+```bash
+uv run pytest transformer_vm/tests/test_crypto003_sha256.py
+uv run wasm-compile transformer_vm/examples/sha256.c \
+  --input-hex 616263 --profile full --output /tmp/sha256
+uv run wasm-reference /tmp/sha256.txt --output-hex
+uv run wasm-run --model model.bin --output-hex /tmp/sha256.txt
+```
+
 ## CRYPTO-002 Binary I/O
 
 Binary input framing adds four little-endian length bytes and one compatibility

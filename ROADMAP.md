@@ -127,12 +127,12 @@ Relevant code: `transformer_vm/compilation/compile_wasm.py`,
 
 Depends on: `CRYPTO-001`, `CRYPTO-002`
 
-- [ ] Add a portable C/WASM SHA-256 implementation to the examples.
-- [ ] Add NIST or RFC known-answer vectors with source citations.
-- [ ] Test empty, short, block-boundary, and multi-block messages.
-- [ ] Verify exact digest output across every runtime backend.
-- [ ] Record tokens per byte, throughput, and peak cache size.
-- [ ] Add at least one SHA-256 vector to CI.
+- [x] Add a portable C/WASM SHA-256 implementation to the examples.
+- [x] Add NIST or RFC known-answer vectors with source citations.
+- [x] Test empty, short, block-boundary, and multi-block messages.
+- [x] Verify exact digest output across every runtime backend.
+- [x] Record tokens per byte, throughput, and peak cache size.
+- [x] Add at least one SHA-256 vector to CI.
 
 Target files: `transformer_vm/examples/sha256.c`,
 `transformer_vm/examples/manifest.yaml`, `transformer_vm/tests/`

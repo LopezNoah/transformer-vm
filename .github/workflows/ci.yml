@@ -37,6 +37,8 @@ jobs:
           echo "$(brew --prefix llvm)/bin" >> $GITHUB_PATH
           echo "$(brew --prefix lld)/bin" >> $GITHUB_PATH
       - run: uv sync --extra dev
+      - name: Verify SHA-256 abc vector
+        run: uv run pytest transformer_vm/tests/test_crypto003_sha256.py -k short --tb=short
       - run: uv run pytest -m "not slow" --tb=short
 
   integration:

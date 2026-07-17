@@ -77,7 +77,7 @@ def test_i64_add_is_legalized_and_matches_v8(tmp_path, left, right):
     *_, output, halted, trapped = run(program)
 
     assert halted and not trapped
-    assert list(output.encode("latin-1")) == _node_output(wasm_path)
+    assert list(output) == _node_output(wasm_path)
     assert "i64." not in prefix
 
 
@@ -92,4 +92,4 @@ def test_i64_shifts_and_rotates_match_v8(tmp_path, opcode, count):
     *_, output, halted, trapped = run(load_program_from_string(prefix), max_tokens=200_000)
 
     assert halted and not trapped
-    assert list(output.encode("latin-1")) == _node_output(wasm_path)
+    assert list(output) == _node_output(wasm_path)
