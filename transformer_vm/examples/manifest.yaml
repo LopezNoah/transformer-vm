@@ -7,6 +7,8 @@ programs:
     args: "7"
   - name: fibonacci
     args: "10"
+  - name: sha256
+    args: "abc"
   - name: min_cost_matching
     args: "3 9 2 7 6 4 3 5 8 1"
   - name: sudoku
