@@ -339,3 +339,28 @@ Depends on: `WASM-002`, `CRYPTO-009`
 - [ ] Define a trace dataset format and leakage-resistant splits.
 - [ ] Define a teacher-forced objective and checkpoint format.
 - [ ] Require regression tests proving learned changes do not break VM semantics.
+
+### RESEARCH-003: Language-agnostic frontend support
+
+Depends on: `COR-003`, `PERF-004`; broader toolchain compatibility depends on `WASM-003`
+
+- [ ] Treat validated WASM, rather than C, as the canonical language-neutral compiler
+  boundary throughout the CLI, documentation, tests, and architecture.
+- [ ] Specify a versioned frontend ABI around the exported `compute` function,
+  linear-memory input, `env.output_byte`, initialization, termination, and traps.
+- [ ] Define compatibility tiers for the current constrained WASM subset and for
+  toolchains requiring indirect calls, runtime allocation, or memory growth.
+- [ ] Add frontend conformance fixtures that can be emitted by any language and verify
+  ABI behavior independently of the existing C runtime header.
+- [ ] Document how external compilers can produce compatible `.wasm` files and provide
+  an opcode/import audit command with actionable diagnostics.
+- [ ] Evaluate at least two non-C source languages to ensure the interface does not
+  encode C-specific assumptions.
+- [ ] Use a deliberately restricted Prolog subset as one end-to-end prototype,
+  covering facts, rules, unification, recursion, and backtracking.
+- [ ] Compare direct Prolog-to-WASM output with portable C or a small WAM-like runtime,
+  checking results against a reference Prolog system.
+- [ ] Measure generated program size, trace length, runtime, and memory use for each
+  frontend and representative workload.
+- [ ] Do not claim compatibility with a language standard or existing runtime without
+  an explicit conformance suite.
