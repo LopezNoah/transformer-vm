@@ -258,10 +258,10 @@ Relevant code: `transformer_vm/attention/`, `transformer_vm/graph/core.py`
 
 ### PERF-004: Reduce trace expansion
 
-- [ ] Measure token expansion by source WASM opcode.
-- [ ] Add native VM operations for the most expensive common lowerings.
-- [ ] Compare trace length before and after each new primitive.
-- [ ] Set performance regression thresholds for crypto workloads.
+- [x] Measure token expansion by source WASM opcode.
+- [x] Add native VM operations for the most expensive common lowerings.
+- [x] Compare trace length before and after each new primitive.
+- [x] Set performance regression thresholds for crypto workloads.
 
 ### PERF-005: Scale program specialization
 

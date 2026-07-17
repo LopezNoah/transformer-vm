@@ -36,6 +36,7 @@ wasm-eval = "transformer_vm.evaluator:main"
 wasm-build = "transformer_vm.build:main"
 wasm-specialize = "transformer_vm.specialize:main"
 wasm-reference = "transformer_vm.wasm.reference:main"
+wasm-trace-profile = "transformer_vm.compilation.trace_profile:main"
 
 [build-system]
 requires = ["setuptools>=82.0.0"]

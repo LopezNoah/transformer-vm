@@ -22,6 +22,19 @@ to reproduce the comparison and enforce that every native path remains smaller.
 These are deterministic reference-trace token counts, not wall-clock runtime
 measurements. Lowered shift costs depend strongly on operand values.
 
+## PERF-004 Trace Expansion
+
+`wasm-trace-profile` measures each source crypto opcode under the fixed
+`(0x81, 7)` workload, comparing the native VM primitive with its legacy
+base-op lowering. The `test_perf004_trace_expansion.py` regression test limits
+each native opcode to 36 tokens and requires every legacy lowering to generate
+at least 10x as many tokens.
+
+```bash
+uv run wasm-trace-profile
+uv run pytest transformer_vm/tests/test_perf004_trace_expansion.py
+```
+
 ## Universal Model Build Comparison
 
 Baseline command: `uv run wasm-run` with no existing `model.bin`.
