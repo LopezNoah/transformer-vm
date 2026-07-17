@@ -319,6 +319,7 @@ class WasmModule:
     functions: list[FuncBody] = field(default_factory=list)
     data_segments: list[DataSegment] = field(default_factory=list)
     globals: list[dict] = field(default_factory=list)
+    memory_bytes: int = 0
 
     @property
     def num_imported_funcs(self) -> int:
@@ -364,11 +365,26 @@ def decode(data: bytes) -> WasmModule:
             _decode_data_section(data, pos, section_end, mod)
         elif section_id == SEC_GLOBAL:
             _decode_global_section(data, pos, section_end, mod)
-        # Skip other sections (custom, table, memory, start, element, datacount)
+        elif section_id == SEC_MEMORY:
+            _decode_memory_section(data, pos, section_end, mod)
+        # Skip other sections (custom, table, start, element, datacount)
 
         pos = section_end
 
     return mod
+
+
+def _decode_memory_section(data: bytes, pos: int, end: int, mod: WasmModule):
+    count, pos = _read_unsigned_leb128(data, pos)
+    if count > 1:
+        raise ValueError("Multiple memories are unsupported")
+    if count == 1:
+        flags = data[pos]
+        pos += 1
+        minimum_pages, pos = _read_unsigned_leb128(data, pos)
+        if flags & 1:
+            _, pos = _read_unsigned_leb128(data, pos)
+        mod.memory_bytes = minimum_pages * 65536
 
 
 def _decode_type_section(data: bytes, pos: int, end: int, mod: WasmModule):

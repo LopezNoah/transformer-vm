@@ -85,6 +85,17 @@ from .decoder import (
 logger = logging.getLogger(__name__)
 
 SCRATCH_ADDR = 0  # Byte 0 of linear memory used as scratch
+DEFAULT_MEMORY_BYTES = 10 * 1024 * 1024
+MEMORY_ACCESS_WIDTHS = {
+    OP_I32_LOAD: 4,
+    OP_I32_LOAD8_S: 1,
+    OP_I32_LOAD8_U: 1,
+    OP_I32_LOAD16_S: 2,
+    OP_I32_LOAD16_U: 2,
+    OP_I32_STORE: 4,
+    OP_I32_STORE8: 1,
+    OP_I32_STORE16: 2,
+}
 
 _CONTROL_OPS = frozenset(
     {
@@ -284,6 +295,87 @@ def _expand_rem_u(c: int, local_a: int) -> list[WasmInstr]:
         _instr(OP_END),
         _instr(OP_END),
         _instr(OP_LOCAL_GET, local_n),
+    ]
+
+
+def _expand_rem_s(c: int, local_a: int) -> list[WasmInstr]:
+    """Expand signed x % C with the dividend's sign, as required by WASM."""
+    c &= 0xFFFFFFFF
+    c_signed = c - (1 << 32) if c >= (1 << 31) else c
+    abs_c = abs(c_signed) & 0xFFFFFFFF
+    local_n = local_a
+    local_negative = local_a + 1
+    return [
+        _instr(OP_LOCAL_SET, local_n),
+        _instr(OP_LOCAL_GET, local_n),
+        _instr(OP_I32_CONST, 0),
+        _instr(OP_I32_LT_S),
+        _instr(OP_LOCAL_SET, local_negative),
+        _instr(OP_BLOCK, 0x40),
+        _instr(OP_LOCAL_GET, local_negative),
+        _instr(OP_I32_EQZ),
+        _instr(OP_BR_IF, 0),
+        _instr(OP_I32_CONST, 0),
+        _instr(OP_LOCAL_GET, local_n),
+        _instr(OP_I32_SUB),
+        _instr(OP_LOCAL_SET, local_n),
+        _instr(OP_END),
+        *_expand_rem_u(abs_c, local_n),
+        _instr(OP_LOCAL_SET, local_n),
+        _instr(OP_BLOCK, 0x40),
+        _instr(OP_LOCAL_GET, local_negative),
+        _instr(OP_I32_EQZ),
+        _instr(OP_BR_IF, 0),
+        _instr(OP_I32_CONST, 0),
+        _instr(OP_LOCAL_GET, local_n),
+        _instr(OP_I32_SUB),
+        _instr(OP_LOCAL_SET, local_n),
+        _instr(OP_END),
+        _instr(OP_LOCAL_GET, local_n),
+    ]
+
+
+def _guard_runtime_division(local_a: int, signed_division: bool) -> list[WasmInstr]:
+    """Trap before a variable division or remainder, then restore its operands."""
+    local_b = local_a + 1
+    guard = [
+        _instr(OP_LOCAL_SET, local_b),
+        _instr(OP_LOCAL_SET, local_a),
+        _instr(OP_LOCAL_GET, local_b),
+        _instr(OP_I32_EQZ),
+        _instr(OP_IF, 0x40),
+        _instr(OP_UNREACHABLE),
+        _instr(OP_END),
+    ]
+    if signed_division:
+        guard += [
+            _instr(OP_BLOCK, 0x40),
+            _instr(OP_LOCAL_GET, local_a),
+            _instr(OP_I32_CONST, -2147483648),
+            _instr(OP_I32_NE),
+            _instr(OP_BR_IF, 0),
+            _instr(OP_LOCAL_GET, local_b),
+            _instr(OP_I32_CONST, -1),
+            _instr(OP_I32_NE),
+            _instr(OP_BR_IF, 0),
+            _instr(OP_UNREACHABLE),
+            _instr(OP_END),
+        ]
+    return guard + [_instr(OP_LOCAL_GET, local_a), _instr(OP_LOCAL_GET, local_b)]
+
+
+def _guard_const_signed_division(local_a: int) -> list[WasmInstr]:
+    """Trap on INT_MIN / -1 while preserving the stack operand."""
+    return [
+        _instr(OP_LOCAL_SET, local_a),
+        _instr(OP_BLOCK, 0x40),
+        _instr(OP_LOCAL_GET, local_a),
+        _instr(OP_I32_CONST, -2147483648),
+        _instr(OP_I32_NE),
+        _instr(OP_BR_IF, 0),
+        _instr(OP_UNREACHABLE),
+        _instr(OP_END),
+        _instr(OP_LOCAL_GET, local_a),
     ]
 
 
@@ -1312,6 +1404,7 @@ def lower_hard_ops(
     num_params: int = 0,
     native_crypto: bool = True,
     enabled_opcodes: set[int] | frozenset[int] | None = None,
+    memory_bytes: int = DEFAULT_MEMORY_BYTES,
 ) -> FuncBody:
     """Lower hard-to-simulate instructions in a function body.
 
@@ -1337,7 +1430,7 @@ def lower_hard_ops(
     )
     lowerable_binops = LOWERABLE_BINOPS - native_ops
     for ins in instrs:
-        if ins.opcode in lowerable_binops or ins.opcode in LOWERABLE_UNARY:
+        if ins.opcode in lowerable_binops or ins.opcode in LOWERABLE_UNARY or ins.opcode in MEMORY_ACCESS_WIDTHS:
             needs_lowering = True
             break
 
@@ -1360,6 +1453,52 @@ def lower_hard_ops(
     lowered_count = 0
     while i < len(instrs):
         ins = instrs[i]
+
+        if ins.opcode in MEMORY_ACCESS_WIDTHS:
+            width = MEMORY_ACCESS_WIDTHS[ins.opcode]
+            offset = ins.immediates[1]
+            max_address = memory_bytes - width
+            local_a = temp_base
+            local_b = temp_base + 1
+            check = [
+                _instr(OP_I32_CONST, max_address),
+                _instr(OP_I32_LE_U),
+                _instr(OP_I32_EQZ),
+                _instr(OP_IF, 0x40),
+                _instr(OP_UNREACHABLE),
+                _instr(OP_END),
+            ]
+            if ins.opcode in {OP_I32_STORE, OP_I32_STORE8, OP_I32_STORE16}:
+                new_instrs.extend(
+                    [
+                        _instr(OP_LOCAL_SET, local_b),
+                        _instr(OP_LOCAL_SET, local_a),
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(OP_I32_CONST, offset),
+                        _instr(OP_I32_ADD),
+                        _instr(OP_LOCAL_TEE, local_a),
+                        *check,
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(OP_LOCAL_GET, local_b),
+                        _instr(ins.opcode, ins.immediates[0], 0),
+                    ]
+                )
+            else:
+                new_instrs.extend(
+                    [
+                        _instr(OP_LOCAL_SET, local_a),
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(OP_I32_CONST, offset),
+                        _instr(OP_I32_ADD),
+                        _instr(OP_LOCAL_TEE, local_a),
+                        *check,
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(ins.opcode, ins.immediates[0], 0),
+                    ]
+                )
+            i += 1
+            lowered_count += 1
+            continue
 
         # Pattern 1: i32.const C + binop
         # Pattern 2: local.get X (where X is a known constant) + binop
@@ -1401,10 +1540,13 @@ def lower_hard_ops(
                 expansion = [_instr(OP_LOCAL_SET, local_a)] + _expand_mul(const_val, local_a)
 
             elif op == OP_I32_DIV_U:
-                expansion = _expand_div_u(const_val, local_a)
+                expansion = [_instr(OP_UNREACHABLE)] if const_val == 0 else _expand_div_u(const_val, local_a)
 
-            elif op in (OP_I32_REM_U, OP_I32_REM_S):
-                expansion = _expand_rem_u(const_val, local_a)
+            elif op == OP_I32_REM_U:
+                expansion = [_instr(OP_UNREACHABLE)] if const_val == 0 else _expand_rem_u(const_val, local_a)
+
+            elif op == OP_I32_REM_S:
+                expansion = [_instr(OP_UNREACHABLE)] if const_val == 0 else _expand_rem_s(const_val, local_a)
 
             elif op == OP_I32_SHL:
                 expansion = _expand_shl_from_stack(const_val, local_a)
@@ -1422,7 +1564,14 @@ def lower_hard_ops(
                 expansion = _expand_or(const_val, local_a)
 
             elif op == OP_I32_DIV_S:
-                expansion = _expand_div_s(const_val, local_a)
+                if const_val == 0:
+                    expansion = [_instr(OP_UNREACHABLE)]
+                else:
+                    expansion = (
+                        _guard_const_signed_division(local_a)
+                        if const_val == 0xFFFFFFFF
+                        else []
+                    ) + _expand_div_s(const_val, local_a)
 
             elif op == OP_I32_ROTL:
                 expansion = _expand_rotl_const(const_val, local_a)
@@ -1627,6 +1776,7 @@ def lower_hard_ops(
             local_q = temp_base + 2
             new_instrs.extend(
                 [
+                    *_guard_runtime_division(local_a, signed_division=False),
                     _instr(OP_LOCAL_SET, local_b),
                     _instr(OP_LOCAL_SET, local_a),
                     _instr(OP_I32_CONST, 0),
@@ -1659,10 +1809,44 @@ def lower_hard_ops(
         if ins.opcode in (OP_I32_REM_U, OP_I32_REM_S):
             local_a = temp_base
             local_b = temp_base + 1
+            if ins.opcode == OP_I32_REM_S:
+                # Signed remainder uses magnitude arithmetic, then restores the dividend's sign.
+                local_negative = temp_base + 2
+                new_instrs.extend(
+                    [
+                        *_guard_runtime_division(local_a, signed_division=False),
+                        _instr(OP_LOCAL_SET, local_b),
+                        _instr(OP_LOCAL_SET, local_a),
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(OP_I32_CONST, 0),
+                        _instr(OP_I32_LT_S),
+                        _instr(OP_LOCAL_SET, local_negative),
+                        _instr(OP_BLOCK, 0x40),
+                        _instr(OP_LOCAL_GET, local_negative),
+                        _instr(OP_I32_EQZ),
+                        _instr(OP_BR_IF, 0),
+                        _instr(OP_I32_CONST, 0),
+                        _instr(OP_LOCAL_GET, local_a),
+                        _instr(OP_I32_SUB),
+                        _instr(OP_LOCAL_SET, local_a),
+                        _instr(OP_END),
+                        _instr(OP_BLOCK, 0x40),
+                        _instr(OP_LOCAL_GET, local_b),
+                        _instr(OP_I32_CONST, 0),
+                        _instr(OP_I32_GE_S),
+                        _instr(OP_BR_IF, 0),
+                        _instr(OP_I32_CONST, 0),
+                        _instr(OP_LOCAL_GET, local_b),
+                        _instr(OP_I32_SUB),
+                        _instr(OP_LOCAL_SET, local_b),
+                        _instr(OP_END),
+                    ]
+                )
+            else:
+                new_instrs.extend(_guard_runtime_division(local_a, signed_division=False))
             new_instrs.extend(
                 [
-                    _instr(OP_LOCAL_SET, local_b),
-                    _instr(OP_LOCAL_SET, local_a),
+                    *([] if ins.opcode == OP_I32_REM_S else [_instr(OP_LOCAL_SET, local_b), _instr(OP_LOCAL_SET, local_a)]),
                     _instr(OP_BLOCK, 0x40),
                     _instr(OP_LOOP, 0x40),
                     _instr(OP_LOCAL_GET, local_a),
@@ -1676,6 +1860,21 @@ def lower_hard_ops(
                     _instr(OP_BR, 0),
                     _instr(OP_END),
                     _instr(OP_END),
+                    *(
+                        [
+                            _instr(OP_BLOCK, 0x40),
+                            _instr(OP_LOCAL_GET, local_negative),
+                            _instr(OP_I32_EQZ),
+                            _instr(OP_BR_IF, 0),
+                            _instr(OP_I32_CONST, 0),
+                            _instr(OP_LOCAL_GET, local_a),
+                            _instr(OP_I32_SUB),
+                            _instr(OP_LOCAL_SET, local_a),
+                            _instr(OP_END),
+                        ]
+                        if ins.opcode == OP_I32_REM_S
+                        else []
+                    ),
                     _instr(OP_LOCAL_GET, local_a),
                 ]
             )
@@ -1710,6 +1909,7 @@ def lower_hard_ops(
             local_neg = temp_base + 3
             new_instrs.extend(
                 [
+                    *_guard_runtime_division(local_a, signed_division=True),
                     _instr(OP_LOCAL_SET, local_b),
                     _instr(OP_LOCAL_SET, local_a),
                     # neg = (a < 0) XOR (b < 0)

@@ -198,11 +198,11 @@ Depends on: `CRYPTO-001`, `CRYPTO-005`
 
 ### WASM-001: Complete i32 semantics
 
-- [ ] Implement divide-by-zero and overflow traps.
-- [ ] Implement exact signed and unsigned remainder semantics.
-- [ ] Implement memory bounds traps.
-- [ ] Verify sign-extension operations.
-- [ ] Publish an opcode and semantics conformance matrix.
+- [x] Implement divide-by-zero and overflow traps.
+- [x] Implement exact signed and unsigned remainder semantics.
+- [x] Implement memory bounds traps.
+- [x] Verify sign-extension operations.
+- [x] Publish an opcode and semantics conformance matrix.
 
 ### WASM-002: Add i64 support
 

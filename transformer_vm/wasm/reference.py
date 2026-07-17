@@ -16,6 +16,18 @@ import os
 logger = logging.getLogger(__name__)
 
 MASK32 = 0xFFFFFFFF
+MEMORY_BYTES = 10 * 1024 * 1024
+
+MEMORY_ACCESS_WIDTHS = {
+    "i32.load": 4,
+    "i32.load8_s": 1,
+    "i32.load8_u": 1,
+    "i32.load16_s": 2,
+    "i32.load16_u": 2,
+    "i32.store": 4,
+    "i32.store8": 1,
+    "i32.store16": 2,
+}
 
 
 def to_signed(v):
@@ -139,7 +151,7 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
     Returns (instr_count, token_count, output_str, halted, trapped) or, if trace=True,
     (instr_count, token_count, output_str, halted, trapped, trace_tokens).
     """
-    mem = bytearray(10 * 1024 * 1024)
+    mem = bytearray(MEMORY_BYTES)
 
     if input_base is None and program and program[0][0] == "input_base":
         input_base = program[0][1]
@@ -162,6 +174,16 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
     while pc < len(program) and token_count < max_tokens:
         op, imm = program[pc]
         instr_count += 1
+
+        if op in MEMORY_ACCESS_WIDTHS:
+            address_operand = stack[-2] if op.startswith("i32.store") else stack[-1]
+            addr = (address_operand + imm) & MASK32
+            if addr > len(mem) - MEMORY_ACCESS_WIDTHS[op]:
+                token_count += 1
+                if trace:
+                    trace_tokens.append("trap")
+                trapped = True
+                break
 
         if op == "input_base":
             input_bytes = input_str.encode("utf-8") + b"\x00" if input_str else b"\x00"
@@ -284,6 +306,32 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
                 trace_tokens.append(_commit(-1, 1, 0))
             pc += 1
 
+        elif op in {"i32.div_s", "i32.div_u", "i32.rem_s", "i32.rem_u"}:
+            bv = stack.pop() & MASK32
+            av = stack.pop() & MASK32
+            if bv == 0 or (op == "i32.div_s" and av == 0x80000000 and bv == MASK32):
+                token_count += 1
+                if trace:
+                    trace_tokens.append("trap")
+                trapped = True
+                break
+            if op == "i32.div_u":
+                result = av // bv
+            elif op == "i32.rem_u":
+                result = av % bv
+            else:
+                signed_a, signed_b = to_signed(av), to_signed(bv)
+                quotient = abs(signed_a) // abs(signed_b)
+                if (signed_a < 0) != (signed_b < 0):
+                    quotient = -quotient
+                result = quotient if op == "i32.div_s" else signed_a - quotient * signed_b
+            stack.append(result & MASK32)
+            token_count += 5
+            if trace:
+                trace_tokens.extend(_byte_tokens(result, 4))
+                trace_tokens.append(_commit(-1, 1, 0))
+            pc += 1
+
         elif op in {
             "i32.and",
             "i32.or",
@@ -324,6 +372,20 @@ def run(program, input_str="", max_tokens=1_000_000, input_base=None, trace=Fals
         elif op == "i32.eqz":
             v = stack.pop()
             result = 1 if v == 0 else 0
+            stack.append(result)
+            token_count += 5
+            if trace:
+                trace_tokens.extend(_byte_tokens(result, 4))
+                trace_tokens.append(_commit(0, 1, 0))
+            pc += 1
+
+        elif op in {"i32.extend8_s", "i32.extend16_s"}:
+            value = stack.pop()
+            bits = 8 if op == "i32.extend8_s" else 16
+            mask = (1 << bits) - 1
+            result = value & mask
+            if result & (1 << (bits - 1)):
+                result |= MASK32 ^ mask
             stack.append(result)
             token_count += 5
             if trace:

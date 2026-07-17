@@ -591,7 +591,12 @@ def compile_wasm_to_prefix(wasm_path: str, profile: str = "auto") -> tuple[str, 
     for fi, func in enumerate(mod.functions):
         type_idx = mod.func_type_indices[fi]
         num_params = len(mod.types[type_idx].params)
-        lowered = lower_hard_ops(func, num_params, enabled_opcodes=enabled_opcodes)
+        lowered = lower_hard_ops(
+            func,
+            num_params,
+            enabled_opcodes=enabled_opcodes,
+            memory_bytes=mod.memory_bytes or 10 * 1024 * 1024,
+        )
         unsupported = check_basic_only(lowered, fi, enabled_opcodes=enabled_opcodes)
         if unsupported:
             details = ", ".join(

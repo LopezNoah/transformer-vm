@@ -13,11 +13,15 @@ from transformer_vm.compilation.decoder import (
     OP_I32_ADD,
     OP_I32_AND,
     OP_I32_CONST,
+    OP_I32_DIV_S,
+    OP_I32_DIV_U,
     OP_I32_EQZ,
     OP_I32_GE_U,
     OP_I32_LOAD,
     OP_I32_LOAD8_U,
     OP_I32_OR,
+    OP_I32_REM_S,
+    OP_I32_REM_U,
     OP_I32_ROTL,
     OP_I32_ROTR,
     OP_I32_SHL,
@@ -251,4 +255,19 @@ def test_signed_right_shift_const_preserves_high_bit():
     inputs = [0x80000000, 0xFFFFFFFF]
     expected = _node_results({"shr_s": original_wasm}, inputs)
     actual = _node_results({"shr_s": _lowered_wasm(lowered)}, inputs)
+    assert actual == expected
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="requires the Node WebAssembly runtime")
+@pytest.mark.parametrize("opcode", [OP_I32_DIV_U, OP_I32_DIV_S, OP_I32_REM_U, OP_I32_REM_S])
+def test_division_and_remainder_lowering_matches_node_wasm_runtime(opcode):
+    """Lowered division and remainder retain WASM signedness for bounded inputs."""
+    original_wasm = _wasm_bitop(opcode)
+    original = decode(original_wasm).functions[0]
+    lowered = lower_hard_ops(original, num_params=2, native_crypto=False)
+
+    assert check_basic_only(lowered) == {}
+    inputs = [1, 7, 0xFFFFFFF9]
+    expected = _node_results({"op": original_wasm}, inputs, [1, 3, 0xFFFFFFFD])
+    actual = _node_results({"op": _lowered_wasm(lowered)}, inputs, [1, 3, 0xFFFFFFFD])
     assert actual == expected
